@@ -15,9 +15,9 @@ pub(crate) fn lock() -> Result<File> {
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = options.open("/var/run/antiban.lock")?;
+    let file = options.open("/var/run/agoc.lock")?;
     file.try_lock()
-        .context("Another antiban guardian/uninstall is running; stop it first")?;
+        .context("Another agoc guardian/uninstall is running; stop it first")?;
     Ok(file)
 }
 
@@ -48,7 +48,7 @@ fn execute(program: &std::path::Path, args: &[&str], input: &str) -> Result<Stri
 
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn nft_rules(policy: &Policy) -> String {
-    let mut rules = String::from("delete table inet antiban\ntable inet antiban {\n");
+    let mut rules = String::from("delete table inet agoc\ntable inet agoc {\n");
     for (family, ipv6, allowed) in [("4", false, policy.allow4), ("6", true, policy.allow6)] {
         let addresses: Vec<_> = policy
             .addresses
@@ -74,11 +74,15 @@ pub(crate) fn nft_rules(policy: &Policy) -> String {
         }
         rules.push_str(" }\n");
     }
-    rules.push_str(
-        "chain output {\n type filter hook output priority -10; policy accept;\n\
-         ip daddr @protected4 ip daddr != @allowed4 counter drop\n\
-         ip6 daddr @protected6 ip6 daddr != @allowed6 counter drop\n}\n}\n",
-    );
+    let protected = "ip daddr @protected4 ip daddr != @allowed4 counter drop\n\
+         ip6 daddr @protected6 ip6 daddr != @allowed6 counter drop\n";
+    rules.push_str("chain output {\n type filter hook output priority -10; policy accept;\n");
+    rules.push_str(protected);
+    rules.push_str("}\n");
+    // Forwarded traffic: containers and VMs routed through this host.
+    rules.push_str("chain forward {\n type filter hook forward priority -10; policy accept;\n");
+    rules.push_str(protected);
+    rules.push_str("}\n}\n");
     rules
 }
 
@@ -93,7 +97,7 @@ pub(crate) fn pf_rules(policy: &Policy) -> String {
             .map(ToString::to_string)
             .collect();
         rules.push_str(&format!(
-            "table <antiban{family}> persist {{ {} }}\n",
+            "table <agoc{family}> persist {{ {} }}\n",
             addresses.join(", ")
         ));
     }
@@ -101,7 +105,7 @@ pub(crate) fn pf_rules(policy: &Policy) -> String {
         if !allowed {
             let inet = if ipv6 { "inet6" } else { "inet" };
             rules.push_str(&format!(
-                "block drop out quick {inet} from any to <antiban{family}>\n"
+                "block drop out quick {inet} from any to <agoc{family}>\n"
             ));
         }
     }
@@ -111,7 +115,7 @@ pub(crate) fn pf_rules(policy: &Policy) -> String {
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare() -> Result<()> {
     let nft = executable(&["/usr/sbin/nft", "/sbin/nft"])?;
-    execute(&nft, &["-f", "-"], "add table inet antiban\n")?;
+    execute(&nft, &["-f", "-"], "add table inet agoc\n")?;
     Ok(())
 }
 
@@ -125,7 +129,7 @@ pub(crate) fn apply(policy: &Policy) -> Result<()> {
 #[cfg(target_os = "linux")]
 pub(crate) fn uninstall() -> Result<()> {
     let nft = executable(&["/usr/sbin/nft", "/sbin/nft"])?;
-    execute(&nft, &["-f", "-"], "delete table inet antiban\n")?;
+    execute(&nft, &["-f", "-"], "delete table inet agoc\n")?;
     Ok(())
 }
 
@@ -134,11 +138,8 @@ pub(crate) fn uninstall_if_present() -> Result<()> {
     {
         let nft = executable(&["/usr/sbin/nft", "/sbin/nft"])?;
         let tables = execute(&nft, &["list", "tables"], "")?;
-        if !tables
-            .lines()
-            .any(|line| line.trim() == "table inet antiban")
-        {
-            eprintln!("Antiban firewall table is already absent");
+        if !tables.lines().any(|line| line.trim() == "table inet agoc") {
+            eprintln!("AGOC firewall table is already absent");
             return Ok(());
         }
     }
@@ -160,8 +161,8 @@ pub(crate) fn prepare() -> Result<()> {
         .lines()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
-    if first != "anchor \"antiban\" all" && first != "anchor \"antiban\"" {
-        bail!("The FIRST active PF filter rule must be anchor \"antiban\" (see README)");
+    if first != "anchor \"agoc\" all" && first != "anchor \"agoc\"" {
+        bail!("The FIRST active PF filter rule must be anchor \"agoc\" (see README)");
     }
     Ok(())
 }
@@ -169,7 +170,7 @@ pub(crate) fn prepare() -> Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) fn apply(policy: &Policy) -> Result<()> {
     let pf = executable(&["/sbin/pfctl"])?;
-    execute(&pf, &["-a", "antiban", "-f", "-"], &pf_rules(policy))?;
+    execute(&pf, &["-a", "agoc", "-f", "-"], &pf_rules(policy))?;
     // PF checks existing states before rules. Kill only states for blocked addresses.
     for ip in &policy.addresses {
         if if ip.is_ipv4() {
@@ -187,7 +188,7 @@ pub(crate) fn apply(policy: &Policy) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub(crate) fn uninstall() -> Result<()> {
     let pf = executable(&["/sbin/pfctl"])?;
-    execute(&pf, &["-a", "antiban", "-F", "all"], "")?;
+    execute(&pf, &["-a", "agoc", "-F", "all"], "")?;
     Ok(())
 }
 
@@ -223,22 +224,30 @@ mod tests {
     }
 
     #[test]
+    fn nft_also_filters_forwarded_container_and_vm_traffic() {
+        let rules = nft_rules(&sample());
+        // Containers/VMs routed through this host are covered too.
+        let forward = &rules[rules.find("chain forward").unwrap()..];
+        assert!(forward.contains("ip daddr @protected4 ip daddr != @allowed4 counter drop"));
+    }
+
+    #[test]
     fn nft_has_family_specific_expiring_permissions_and_output_drops() {
         let rules = nft_rules(&sample());
         assert!(rules.contains("198.51.100.8 timeout 30s"));
         assert!(!rules.contains("2001:db8::8 timeout"));
         assert!(rules.contains("ip daddr @protected4 ip daddr != @allowed4 counter drop"));
         assert!(rules.contains("ip6 daddr @protected6 ip6 daddr != @allowed6 counter drop"));
-        assert!(rules.starts_with("delete table inet antiban\n"));
+        assert!(rules.starts_with("delete table inet agoc\n"));
     }
 
     #[test]
     fn pf_blocks_only_disabled_family() {
         let rules = pf_rules(&sample());
         assert!(!rules.contains("block drop out quick inet from"));
-        assert!(rules.contains("block drop out quick inet6 from any to <antiban6>"));
-        assert!(rules.contains("table <antiban4> persist { 198.51.100.8 }"));
-        assert!(rules.contains("table <antiban6> persist { 2001:db8::8 }"));
+        assert!(rules.contains("block drop out quick inet6 from any to <agoc6>"));
+        assert!(rules.contains("table <agoc4> persist { 198.51.100.8 }"));
+        assert!(rules.contains("table <agoc6> persist { 2001:db8::8 }"));
     }
 
     #[test]
@@ -268,8 +277,8 @@ mod tests {
         assert_ne!(
             std::fs::read_link("/proc/self/ns/net").unwrap(),
             std::path::PathBuf::from(
-                std::env::var("ANTIBAN_TEST_HOST_NETNS")
-                    .expect("Set ANTIBAN_TEST_HOST_NETNS before unshare; see README")
+                std::env::var("AGOC_TEST_HOST_NETNS")
+                    .expect("Set AGOC_TEST_HOST_NETNS before unshare; see README")
             ),
             "Use a private network namespace"
         );

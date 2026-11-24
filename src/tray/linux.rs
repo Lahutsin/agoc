@@ -5,30 +5,37 @@ struct Indicator {
     label: String,
     details: [String; 3],
     color: Color,
-    artwork: Vec<u8>,
+    artwork: Vec<Artwork>,
     quitting: bool,
     events: Sender<Event>,
 }
 
 impl Tray for Indicator {
     fn id(&self) -> String {
-        "antiban".into()
+        "agoc".into()
     }
 
     fn title(&self) -> String {
-        format!("Antiban: {}", self.label)
+        format!("AGOC: {}", self.label)
     }
 
+    /// Every pre-rendered size; the tray host picks the one closest to its panel
+    /// size and scale, so nothing gets resampled.
     fn icon_pixmap(&self) -> Vec<Icon> {
-        let mut argb = pixels(&self.artwork, self.color);
-        for pixel in argb.as_chunks_mut::<4>().0 {
-            pixel.rotate_right(1);
-        }
-        vec![Icon {
-            width: ICON_SIZE as i32,
-            height: ICON_SIZE as i32,
-            data: argb,
-        }]
+        self.artwork
+            .iter()
+            .map(|art| {
+                let mut argb = pixels(art, self.color);
+                for pixel in argb.as_chunks_mut::<4>().0 {
+                    pixel.rotate_right(1);
+                }
+                Icon {
+                    width: art.size as i32,
+                    height: art.size as i32,
+                    data: argb,
+                }
+            })
+            .collect()
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
@@ -72,7 +79,7 @@ impl Tray for Indicator {
 pub(super) fn run(options: Options) -> Result<()> {
     let (events, incoming) = mpsc::channel();
     let mut view = View::default();
-    let artwork = icon_pixels()?;
+    let artwork = artwork()?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let handle = loop {
         let result = Indicator {

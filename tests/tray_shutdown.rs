@@ -1,6 +1,6 @@
 #![cfg(all(target_os = "linux", feature = "tray"))]
 
-use antiban::control::{send, Message};
+use agoc::control::{send, Message};
 use std::{
     fs,
     io::{BufRead, BufReader},
@@ -48,18 +48,18 @@ fn tray_quit_and_disconnect_in_private_namespace() {
     assert_eq!(fields[2], "1");
     assert_ne!(
         fs::read_link("/proc/self/ns/net").unwrap(),
-        std::path::PathBuf::from(std::env::var("ANTIBAN_TEST_HOST_NETNS").unwrap())
+        std::path::PathBuf::from(std::env::var("AGOC_TEST_HOST_NETNS").unwrap())
     );
     assert_ne!(
         fs::read_link("/proc/self/ns/mnt").unwrap(),
-        std::path::PathBuf::from(std::env::var("ANTIBAN_TEST_HOST_MNTNS").unwrap())
+        std::path::PathBuf::from(std::env::var("AGOC_TEST_HOST_MNTNS").unwrap())
     );
     assert!(Command::new("/usr/bin/mount")
         .args(["-t", "tmpfs", "tmpfs", "/var/run"])
         .status()
         .unwrap()
         .success());
-    let executable = env!("CARGO_BIN_EXE_antiban");
+    let executable = env!("CARGO_BIN_EXE_agoc");
     let directory = tempfile::tempdir().unwrap();
     let baseline = directory.path().join("baseline.txt");
     let original = "antiban-v1\n198.51.100.9\n-\n";
@@ -179,7 +179,7 @@ fn tray_quit_and_disconnect_in_private_namespace() {
             "Startup must not overwrite the original IP"
         );
         let table = Command::new("/usr/sbin/nft")
-            .args(["list", "table", "inet", "antiban"])
+            .args(["list", "table", "inet", "agoc"])
             .output()
             .unwrap();
         assert_eq!(table.status.success(), !explicit_quit);

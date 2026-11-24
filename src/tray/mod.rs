@@ -25,7 +25,7 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "Claude/Anthropic external-IP gate in the system tray"
+    about = "External-IP gate for AI services (Claude, OpenAI, Copilot) in the system tray"
 )]
 pub struct Options {
     /// Use the restricted passwordless helper installed by install-autostart.sh.
@@ -94,7 +94,7 @@ impl View {
                 let allow6 = allow6 && network.ipv6.changed();
                 self.label = if allow4 || allow6 {
                     let family = match (allow4, allow6) { (true, true) => "IPv4 + IPv6", (true, false) => "IPv4", _ => "IPv6" };
-                    format!("IP changed - OK to use ({family}; {addresses} known IPs)")
+                    format!("IP changed - OK to use ({family}, {addresses} IPs)")
                 } else if network.error.is_some() {
                     if network.ipv4.original.is_none() && network.ipv6.original.is_none() {
                         "Original IP unknown - BLOCKED".into()
@@ -112,47 +112,43 @@ impl View {
                 } else {
                     "IP unchanged - BLOCKED".into()
                 };
-                let detail = |family: &crate::network::FamilyStatus, name, allowed| {
-                    let text = format!(
-                        "{} - {}",
-                        family.label(name),
-                        if allowed { "ALLOWED" } else { "BLOCKED" }
-                    );
-                    family
-                        .error
-                        .as_ref()
-                        .map_or(text.clone(), |error| format!("{text}; {error}"))
-                };
                 self.details = [
-                    detail(&network.ipv4, "IPv4", allow4),
-                    detail(&network.ipv6, "IPv6", allow6),
-                    network.error.clone().unwrap_or_else(|| {
-                        network.interface.as_ref().map_or_else(
-                            || {
-                                if network.ipv4.original.is_some()
-                                    || network.ipv6.original.is_some()
-                                {
-                                    "Original source: saved baseline".into()
-                                } else {
-                                    "Direct interface: detecting...".into()
-                                }
-                            },
-                            |name| format!("Direct interface: {name}"),
-                        )
-                    }),
+                    family_row(&network.ipv4, "IPv4", allow4),
+                    family_row(&network.ipv6, "IPv6", allow6),
+                    fit(&network.error.as_deref().map_or_else(
+                        || {
+                            network.interface.as_ref().map_or_else(
+                                || {
+                                    if network.ipv4.original.is_some()
+                                        || network.ipv6.original.is_some()
+                                    {
+                                        "Original source: saved baseline".into()
+                                    } else {
+                                        "Direct interface: detecting...".into()
+                                    }
+                                },
+                                |name| format!("Direct interface: {name}"),
+                            )
+                        },
+                        |error| format!("Check failed: {}", reason(error)),
+                    )),
                 ];
+                self.label = fit(&self.label);
+                // No public IPv6 on the current route: all traffic leaves over IPv4,
+                // so a changed IPv4 alone is enough for green. IPv6 stays blocked in
+                // the firewall regardless (allow6 is not touched here).
+                let ipv6_unused = network.ipv6.current.is_none();
                 self.color = match (allow4, allow6) {
                     (true, true) => Color::Allowed,
+                    (true, false) if ipv6_unused => Color::Allowed,
                     (false, false) => Color::Blocked,
                     _ => Color::Partial,
                 };
             }
             Event::Status(Message::Failure { message }) | Event::Failed(message) => {
                 eprintln!("ERROR: {message}");
-                self.label = format!(
-                    "Error: {}. Rules may remain; see README.",
-                    message.chars().take(180).collect::<String>()
-                );
+                self.label = fit(&format!("Error: {}", reason(&message)));
+                self.details[2] = "Rules may remain; see README".into();
                 self.color = Color::Blocked;
                 self.failed = true;
                 self.quitting = false;
@@ -170,41 +166,169 @@ impl View {
     }
 }
 
-const ICON_SIZE: u32 = 32;
-const ICON_PNG: &[u8] = include_bytes!("../../icon/icon.png");
+/// Longest menu row, in characters. Full errors go to stderr (see the monitor log);
+/// the menu only shows a short reason so it stays a sane width.
+const MENU_WIDTH: usize = 60;
 
-fn icon_pixels() -> Result<Vec<u8>> {
-    let source = image::load_from_memory_with_format(ICON_PNG, image::ImageFormat::Png)
-        .context("Cannot decode embedded tray icon")?;
-    let resized = source
-        .resize(ICON_SIZE, ICON_SIZE, image::imageops::FilterType::Lanczos3)
-        .to_rgba8();
-    let mut canvas = image::RgbaImage::new(ICON_SIZE, ICON_SIZE);
-    image::imageops::overlay(
-        &mut canvas,
-        &resized,
-        i64::from((ICON_SIZE - resized.width()) / 2),
-        i64::from((ICON_SIZE - resized.height()) / 2),
-    );
-    Ok(canvas.into_raw())
+/// Cut text to `MENU_WIDTH` characters, ending with an ellipsis when shortened.
+fn fit(text: &str) -> String {
+    if text.chars().count() <= MENU_WIDTH {
+        return text.into();
+    }
+    let mut short: String = text.chars().take(MENU_WIDTH - 1).collect();
+    short.push('…');
+    short
 }
 
-fn pixels(base: &[u8], color: Color) -> Vec<u8> {
+/// Root cause of the first error in an anyhow `{:#}` chain (`"a: b: root; c: d"`),
+/// without the `(os error N)` suffix.
+fn reason(error: &str) -> &str {
+    let first = error.split("; ").next().unwrap_or(error);
+    let root = first.rsplit(": ").next().unwrap_or(first).trim();
+    match root.rfind(" (os error ") {
+        Some(index) if root.ends_with(')') => &root[..index],
+        _ => root,
+    }
+}
+
+/// Long IPv6 addresses keep the first three groups and the last one.
+fn short_ip(ip: std::net::IpAddr) -> String {
+    let text = ip.to_string();
+    if text.len() <= 21 {
+        return text;
+    }
+    let groups: Vec<&str> = text.split(':').collect();
+    format!("{}:…:{}", groups[..3].join(":"), groups[groups.len() - 1])
+}
+
+/// One compact menu row per address family, e.g. `IPv4 ALLOWED: 1.2.3.4 → 5.6.7.8`.
+fn family_row(family: &crate::network::FamilyStatus, name: &str, allowed: bool) -> String {
+    let state = match (family.original, family.current) {
+        (Some(original), Some(current)) if original == current => {
+            format!("unchanged {}", short_ip(original))
+        }
+        (Some(original), Some(current)) => {
+            format!("{} → {}", short_ip(original), short_ip(current))
+        }
+        (None, _) => "original unknown".into(),
+        (Some(_), None) => "unavailable".into(),
+    };
+    let verdict = if allowed { "ALLOWED" } else { "BLOCKED" };
+    fit(&match &family.error {
+        Some(error) => format!("{name} {verdict}: {state} ({})", reason(error)),
+        None => format!("{name} {verdict}: {state}"),
+    })
+}
+
+/// Pre-rendered, pixel-hinted tray artwork from `icon/gen_icon.py`, one PNG per size.
+/// Each size is used as-is: resampling one big image at runtime is what made small
+/// tray icons blurry. Linux hosts pick the closest size for their panel and scale;
+/// macOS uses `macos::ICON_SIZE`.
+const ARTWORK: &[(u32, &[u8])] = &[
+    (16, include_bytes!("../../icon/tray/tray-16.png")),
+    (18, include_bytes!("../../icon/tray/tray-18.png")),
+    (20, include_bytes!("../../icon/tray/tray-20.png")),
+    (22, include_bytes!("../../icon/tray/tray-22.png")),
+    (24, include_bytes!("../../icon/tray/tray-24.png")),
+    (32, include_bytes!("../../icon/tray/tray-32.png")),
+    (36, include_bytes!("../../icon/tray/tray-36.png")),
+    (40, include_bytes!("../../icon/tray/tray-40.png")),
+    (44, include_bytes!("../../icon/tray/tray-44.png")),
+    (48, include_bytes!("../../icon/tray/tray-48.png")),
+    (64, include_bytes!("../../icon/tray/tray-64.png")),
+];
+
+/// One decoded artwork size: `size` x `size` RGBA pixels.
+#[derive(Clone)]
+struct Artwork {
+    size: u32,
+    rgba: Vec<u8>,
+}
+
+fn artwork() -> Result<Vec<Artwork>> {
+    ARTWORK
+        .iter()
+        .map(|&(size, png)| {
+            let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+                .with_context(|| format!("Cannot decode embedded {size}px tray icon"))?
+                .to_rgba8();
+            if image.dimensions() != (size, size) {
+                bail!(
+                    "Embedded {size}px tray icon has size {:?}",
+                    image.dimensions()
+                );
+            }
+            Ok(Artwork {
+                size,
+                rgba: image.into_raw(),
+            })
+        })
+        .collect()
+}
+
+/// Status dot geometry for one icon size: (radius, ring width, first row/column it
+/// can touch). The dot is about half the icon wide and touches the bottom-right
+/// corner; the radius is a whole number of pixels so its edges land on the pixel
+/// grid and stay sharp.
+fn badge(size: u32) -> (f32, f32, u32) {
+    let radius = size / 4;
+    let ring = (size as f32 / 16.0).round().max(1.0);
+    (radius as f32, ring, size - 2 * radius)
+}
+
+fn pixels(art: &Artwork, color: Color) -> Vec<u8> {
     let rgb = match color {
         Color::Waiting => [130, 140, 150],
         Color::Blocked => [220, 55, 55],
         Color::Allowed => [45, 190, 90],
         Color::Partial => [235, 170, 35],
     };
-    let mut rgba = base.to_vec();
-    for y in 23i32..32 {
-        for x in 23i32..32 {
-            let radius = (x - 27).pow(2) + (y - 27).pow(2);
-            if radius <= 16 {
-                let offset = ((y as usize * ICON_SIZE as usize) + x as usize) * 4;
-                let color = if radius <= 9 { rgb } else { [255, 255, 255] };
-                rgba[offset..offset + 4].copy_from_slice(&[color[0], color[1], color[2], 255]);
+    // Green and red get a black ring (red on the shield and on light panels reads
+    // better with it); gray and amber keep a white ring.
+    let ring = if matches!(color, Color::Allowed | Color::Blocked) {
+        [0, 0, 0]
+    } else {
+        [255, 255, 255]
+    };
+    // Status dot in the bottom-right corner: colored disc with a contrasting ring,
+    // anti-aliased with 4x4 supersampling and blended over the artwork.
+    const SAMPLES: u32 = 4;
+    let size = art.size;
+    let (radius, ring_width, top) = badge(size);
+    let center = size as f32 - radius;
+    let inner = radius - ring_width;
+    let mut rgba = art.rgba.clone();
+    for y in top..size {
+        for x in top..size {
+            let (mut in_outer, mut in_inner) = (0u32, 0u32);
+            for sy in 0..SAMPLES {
+                for sx in 0..SAMPLES {
+                    let dx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - center;
+                    let dy = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - center;
+                    let distance = dx * dx + dy * dy;
+                    if distance <= radius * radius {
+                        in_outer += 1;
+                        if distance <= inner * inner {
+                            in_inner += 1;
+                        }
+                    }
+                }
             }
+            if in_outer == 0 {
+                continue;
+            }
+            let offset = ((y * size + x) * 4) as usize;
+            let alpha = in_outer as f32 / (SAMPLES * SAMPLES) as f32;
+            let fill = in_inner as f32 / in_outer as f32;
+            let dst_alpha = rgba[offset + 3] as f32 / 255.0;
+            let out_alpha = alpha + dst_alpha * (1.0 - alpha);
+            for channel in 0..3 {
+                let badge = rgb[channel] as f32 * fill + ring[channel] as f32 * (1.0 - fill);
+                let under = rgba[offset + channel] as f32;
+                let value = (badge * alpha + under * dst_alpha * (1.0 - alpha)) / out_alpha;
+                rgba[offset + channel] = value.round() as u8;
+            }
+            rgba[offset + 3] = (out_alpha * 255.0).round() as u8;
         }
     }
     rgba
@@ -213,7 +337,7 @@ fn pixels(base: &[u8], color: Color) -> Vec<u8> {
 pub fn run(options: Options) -> Result<()> {
     let uid = Command::new("/usr/bin/id").arg("-u").output()?;
     if !uid.status.success() || uid.stdout == b"0\n" {
-        bail!("Run antiban-tray as your desktop user, NOT with sudo");
+        bail!("Run agoc-tray as your desktop user, NOT with sudo");
     }
     let uid: u32 = std::str::from_utf8(&uid.stdout)
         .context("Invalid output from id -u")?
@@ -221,7 +345,7 @@ pub fn run(options: Options) -> Result<()> {
         .parse()
         .context("Invalid desktop user ID")?;
     let Some(_instance_lock) = InstanceLock::acquire(uid)? else {
-        eprintln!("Antiban tray is already running; ignoring duplicate launch");
+        eprintln!("AGOC tray is already running; ignoring duplicate launch");
         return Ok(());
     };
     #[cfg(target_os = "linux")]
@@ -236,7 +360,7 @@ struct InstanceLock {
 
 impl InstanceLock {
     fn acquire(uid: u32) -> Result<Option<Self>> {
-        let path = std::env::temp_dir().join(format!("antiban-tray-{uid}.lock"));
+        let path = std::env::temp_dir().join(format!("agoc-tray-{uid}.lock"));
         Self::acquire_at(&path, uid)
     }
 
@@ -276,7 +400,7 @@ impl Worker {
     fn start(options: Options, notify: impl Fn(Event) + Send + 'static) -> Result<Self> {
         let (commands, receiver) = mpsc::channel();
         thread::Builder::new()
-            .name("antiban-monitor".into())
+            .name("agoc-monitor".into())
             .spawn(move || {
                 if let Err(error) = work(options, receiver, &notify) {
                     notify(Event::Failed(format!("{error:#}")));
@@ -363,9 +487,9 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
     let program = std::env::current_exe()?
         .parent()
         .context("Cannot locate executable directory")?
-        .join("antiban")
+        .join("agoc")
         .canonicalize()
-        .context("Keep antiban and antiban-tray in the same directory")?;
+        .context("Keep agoc and agoc-tray in the same directory")?;
     let mut options = options;
     if let Some(state) = &options.network.state {
         options.network.state = Some(
@@ -378,7 +502,7 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
         .canonicalize()
         .context("Cannot resolve temporary directory")?;
     let directory = tempfile::Builder::new()
-        .prefix("antiban-tray-")
+        .prefix("agoc-tray-")
         .tempdir_in(temporary_root)?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
     let path = directory.path().join("control.sock");
@@ -472,7 +596,7 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let uid = directory.path().metadata().unwrap().uid();
-        let path = directory.path().join("antiban-tray.lock");
+        let path = directory.path().join("agoc-tray.lock");
         let first = InstanceLock::acquire_at(&path, uid).unwrap().unwrap();
         assert!(InstanceLock::acquire_at(&path, uid).unwrap().is_none());
         drop(first);
@@ -530,43 +654,184 @@ mod tests {
                 .unwrap());
             assert_eq!(view.color, color);
             assert_eq!(view.label.contains("OK to use"), v4 || v6);
-            assert!(view.details[0].contains("original 8.8.8.8 -> current"));
+            assert!(view.details[0].starts_with("IPv4 "));
+            assert!(view.details[0].contains("8.8.8.8"));
+            assert!(view.details[1].contains(if v6 {
+                "2001:4860:4860::8888 → 2606:4700:4700::1111"
+            } else {
+                "unchanged 2001:4860:4860::8888"
+            }));
         }
         assert!(!view.event(Event::Quit, &worker).unwrap());
         assert!(view.quitting);
         assert!(view.event(Event::Finished, &worker).unwrap());
-        assert_eq!(
-            pixels(&icon_pixels().unwrap(), Color::Blocked).len(),
-            32 * 32 * 4
-        );
+        for art in artwork().unwrap() {
+            assert_eq!(
+                pixels(&art, Color::Blocked).len(),
+                (art.size * art.size * 4) as usize
+            );
+        }
     }
 
     #[test]
     fn embedded_artwork_is_visible_and_preserved_outside_status_badge() {
-        let base = icon_pixels().unwrap();
-        assert_eq!(base.len(), (ICON_SIZE * ICON_SIZE * 4) as usize);
-        assert!(base
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|pixel| pixel[3] > 0 && pixel[0] > 100));
-        let offset = ((27 * ICON_SIZE + 27) * 4) as usize;
-        for (color, rgb) in [
-            (Color::Waiting, [130, 140, 150]),
-            (Color::Blocked, [220, 55, 55]),
-            (Color::Allowed, [45, 190, 90]),
-            (Color::Partial, [235, 170, 35]),
-        ] {
-            let rendered = pixels(&base, color);
-            assert_eq!(
-                &rendered[..23 * ICON_SIZE as usize * 4],
-                &base[..23 * ICON_SIZE as usize * 4]
-            );
-            assert_eq!(
-                &rendered[offset..offset + 4],
-                &[rgb[0], rgb[1], rgb[2], 255]
-            );
+        let all = artwork().unwrap();
+        assert_eq!(
+            all.iter().map(|art| art.size).collect::<Vec<_>>(),
+            [16, 18, 20, 22, 24, 32, 36, 40, 44, 48, 64]
+        );
+        for art in &all {
+            let size = art.size;
+            assert_eq!(art.rgba.len(), (size * size * 4) as usize);
+            // Opaque blue shield rim exists at every size.
+            assert!(art
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel[3] == 255 && pixel[2] > 200 && pixel[0] < 100));
+            let (radius, _, top) = badge(size);
+            let middle = size - radius as u32;
+            let offset = ((middle * size + middle) * 4) as usize;
+            for (color, rgb) in [
+                (Color::Waiting, [130, 140, 150]),
+                (Color::Blocked, [220, 55, 55]),
+                (Color::Allowed, [45, 190, 90]),
+                (Color::Partial, [235, 170, 35]),
+            ] {
+                let rendered = pixels(art, color);
+                // Everything above the dot is untouched artwork.
+                let row = (top * size * 4) as usize;
+                assert_eq!(&rendered[..row], &art.rgba[..row], "{size}px");
+                // Just inside the dot's left edge is ring: black for green and red, white otherwise.
+                let ring = ((middle * size + top) * 4) as usize;
+                let ring_rgb = if matches!(color, Color::Allowed | Color::Blocked) {
+                    [0, 0, 0]
+                } else {
+                    [255, 255, 255]
+                };
+                assert_eq!(&rendered[ring..ring + 3], &ring_rgb, "{size}px");
+                assert_eq!(
+                    &rendered[offset..offset + 4],
+                    &[rgb[0], rgb[1], rgb[2], 255],
+                    "{size}px"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn menu_rows_stay_narrow_with_long_errors_and_ipv6() {
+        let (commands, _receiver) = mpsc::channel();
+        let worker = Worker { commands };
+        let long_error = "Current IP unknown: IP probe failed (https://api6.ipify.org, \
+            interface None): error sending request for url (https://api6.ipify.org/): \
+            client error (Connect): tcp connect error: Network is unreachable (os error 101); \
+            Original IP unknown: IP probe failed (https://api6.ipify.org, interface \
+            Some(\"enp2s0\")): operation timed out";
+        let mut view = View::default();
+        view.event(
+            Event::Status(Message::Status {
+                allow4: true,
+                allow6: false,
+                addresses: 123_456,
+                network: crate::network::NetworkStatus {
+                    interface: Some("enp2s0".into()),
+                    ipv4: crate::network::FamilyStatus {
+                        original: Some("203.0.113.10".parse().unwrap()),
+                        current: Some("198.51.100.200".parse().unwrap()),
+                        error: None,
+                    },
+                    ipv6: crate::network::FamilyStatus {
+                        original: Some("2a01:4f8:c0c:1234:5678:9abc:def0:1234".parse().unwrap()),
+                        current: None,
+                        error: Some(long_error.into()),
+                    },
+                    error: None,
+                },
+            }),
+            &worker,
+        )
+        .unwrap();
+        assert_eq!(view.label, "IP changed - OK to use (IPv4, 123456 IPs)");
+        assert_eq!(
+            view.details[0],
+            "IPv4 ALLOWED: 203.0.113.10 → 198.51.100.200"
+        );
+        assert_eq!(
+            view.details[1],
+            "IPv6 BLOCKED: unavailable (Network is unreachable)"
+        );
+        assert_eq!(view.details[2], "Direct interface: enp2s0");
+        assert_eq!(
+            family_row(
+                &crate::network::FamilyStatus {
+                    original: Some("2a01:4f8:c0c:1234:5678:9abc:def0:1234".parse().unwrap()),
+                    current: Some("2a02:4780:10:5be4:aaaa:bbbb:cccc:7".parse().unwrap()),
+                    error: None,
+                },
+                "IPv6",
+                true,
+            ),
+            "IPv6 ALLOWED: 2a01:4f8:c0c:…:1234 → 2a02:4780:10:…:7"
+        );
+        view.event(Event::Failed(long_error.repeat(5)), &worker)
+            .unwrap();
+        assert_eq!(view.label, "Error: Network is unreachable");
+        for row in std::iter::once(&view.label).chain(&view.details) {
+            assert!(row.chars().count() <= MENU_WIDTH, "{row}");
+        }
+        assert_eq!(fit(&"x".repeat(200)).chars().count(), MENU_WIDTH);
+    }
+
+    #[test]
+    fn changed_ipv4_is_green_when_ipv6_is_not_in_use() {
+        let (commands, _receiver) = mpsc::channel();
+        let worker = Worker { commands };
+        let ipv4 = crate::network::FamilyStatus {
+            original: Some("8.8.8.8".parse().unwrap()),
+            current: Some("1.1.1.1".parse().unwrap()),
+            error: None,
+        };
+        let status = |allow4, ipv6| {
+            Event::Status(Message::Status {
+                allow4,
+                allow6: false,
+                addresses: 2,
+                network: crate::network::NetworkStatus {
+                    ipv4: ipv4.clone(),
+                    ipv6,
+                    ..Default::default()
+                },
+            })
+        };
+        let no_ipv6 = crate::network::FamilyStatus {
+            original: Some("2001:4860:4860::8888".parse().unwrap()),
+            current: None,
+            error: Some("Current IP unknown: no route".into()),
+        };
+
+        // IPv4 changed, no IPv6 on the current route -> green.
+        let mut view = View::default();
+        view.event(status(true, no_ipv6.clone()), &worker).unwrap();
+        assert_eq!(view.color, Color::Allowed);
+        assert!(view.label.contains("OK to use"));
+        assert!(view.details[1].contains("BLOCKED"));
+
+        // IPv6 reachable but unchanged -> still amber.
+        let mut view = View::default();
+        let unchanged = crate::network::FamilyStatus {
+            original: Some("2001:4860:4860::8888".parse().unwrap()),
+            current: Some("2001:4860:4860::8888".parse().unwrap()),
+            error: None,
+        };
+        view.event(status(true, unchanged), &worker).unwrap();
+        assert_eq!(view.color, Color::Partial);
+
+        // IPv4 not allowed -> red, even without IPv6.
+        let mut view = View::default();
+        view.event(status(false, no_ipv6), &worker).unwrap();
+        assert_eq!(view.color, Color::Blocked);
     }
 
     #[test]
@@ -591,16 +856,15 @@ mod tests {
 
     #[test]
     fn automatic_launch_needs_no_saved_baseline() {
-        let options = Options::try_parse_from(["antiban-tray"]).unwrap();
+        let options = Options::try_parse_from(["agoc-tray"]).unwrap();
         let arguments = monitor_arguments(&options, Path::new("/tmp/control.sock"));
         assert!(!arguments.iter().any(|arg| arg == "--state"));
-        let options =
-            Options::try_parse_from(["antiban-tray", "--direct-interface", "en0"]).unwrap();
+        let options = Options::try_parse_from(["agoc-tray", "--direct-interface", "en0"]).unwrap();
         assert!(monitor_arguments(&options, Path::new("/tmp/control.sock"))
             .windows(2)
             .any(|args| args == ["--direct-interface", "en0"]));
         assert!(Options::try_parse_from([
-            "antiban-tray",
+            "agoc-tray",
             "--direct-interface",
             "en0",
             "--state",
@@ -611,18 +875,18 @@ mod tests {
 
     #[test]
     fn installed_mode_uses_only_the_restricted_helper() {
-        let options = Options::try_parse_from(["antiban-tray", "--installed-helper"]).unwrap();
+        let options = Options::try_parse_from(["agoc-tray", "--installed-helper"]).unwrap();
         assert_eq!(
             monitor_arguments(&options, Path::new("/tmp/control.sock")),
             ["desktop-helper", "--control", "/tmp/control.sock"]
         );
         for flag in ["--state", "--direct-interface", "--interval", "--domain"] {
             assert!(
-                Options::try_parse_from(["antiban-tray", "--installed-helper", flag, "x"]).is_err()
+                Options::try_parse_from(["agoc-tray", "--installed-helper", flag, "x"]).is_err()
             );
         }
         let command = elevation(
-            Path::new("/opt/antiban/antiban"),
+            Path::new("/opt/agoc/agoc"),
             &monitor_arguments(&options, Path::new("/tmp/control.sock")),
             true,
         )

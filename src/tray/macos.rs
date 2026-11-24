@@ -9,8 +9,16 @@ use tray_icon::{
     Icon, TrayIconBuilder,
 };
 
+/// The macOS menu bar draws status icons 18 pt high (tray-icon sets the NSImage
+/// size to 18 pt). 36 px is pixel-exact on Retina (@2x) and a clean 2:1
+/// downscale on @1x displays, so the icon is never blurred by fractional scaling.
+const ICON_SIZE: u32 = 36;
+
 pub(super) fn run(options: Options) -> Result<()> {
-    let artwork = icon_pixels()?;
+    let artwork = artwork()?
+        .into_iter()
+        .find(|art| art.size == ICON_SIZE)
+        .context("Missing 36px tray icon")?;
     let mut event_loop = EventLoopBuilder::<Event>::with_user_event().build();
     event_loop.set_activation_policy(ActivationPolicy::Accessory);
     let proxy = event_loop.create_proxy();
@@ -53,7 +61,7 @@ pub(super) fn run(options: Options) -> Result<()> {
                     icon = Some(
                         TrayIconBuilder::new()
                             .with_menu(Box::new(menu.clone()))
-                            .with_tooltip("Antiban")
+                            .with_tooltip("AGOC")
                             .with_icon(Icon::from_rgba(
                                 pixels(&artwork, view.color),
                                 ICON_SIZE,
@@ -105,7 +113,7 @@ pub(super) fn run(options: Options) -> Result<()> {
             }
             Err(error) => {
                 eprintln!("Tray error: {error:#}");
-                status.set_text(format!("Error: {error:#}"));
+                status.set_text(fit(&format!("Error: {}", reason(&format!("{error:#}")))));
                 if worker.is_none() {
                     icon.take();
                     *flow = ControlFlow::Exit;

@@ -102,7 +102,7 @@ mod tests {
     #[test]
     fn explicit_quit_is_distinct_from_disconnection() {
         let path =
-            std::env::temp_dir().join(format!("antiban-control-test-{}.sock", std::process::id()));
+            std::env::temp_dir().join(format!("agoc-control-test-{}.sock", std::process::id()));
         let listener = UnixListener::bind(&path).unwrap();
         let control = Control::connect(&path).unwrap();
         let (mut peer, _) = listener.accept().unwrap();

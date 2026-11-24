@@ -9,6 +9,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "agoc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "image",
+ "ksni",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tao",
+ "tempfile",
+ "tray-icon",
+]
+
+[[package]]
 name = "anstream"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,24 +74,6 @@ dependencies = [
  "anstyle",
  "once_cell_polyfill",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "antiban"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "image",
- "ksni",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "tao",
- "tempfile",
- "tray-icon",
 ]
 
 [[package]]
