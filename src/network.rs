@@ -374,7 +374,11 @@ mod tests {
             .send()
             .unwrap_err();
         let error = anyhow::Error::from(error);
-        assert!(format!("{error:#}").contains("bind interface"), "{error:#}");
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("bind interface") || text.contains("interface name to index"),
+            "{text}"
+        );
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

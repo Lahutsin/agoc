@@ -543,6 +543,8 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
         }
         thread::sleep(Duration::from_millis(100));
     };
+    // On macOS/BSD, accepted sockets inherit O_NONBLOCK from a non-blocking listener.
+    stream.set_nonblocking(false)?;
     let reader = stream.try_clone()?;
     let (messages, incoming) = mpsc::channel();
     thread::spawn(move || {
@@ -893,5 +895,33 @@ mod tests {
         .unwrap();
         assert_eq!(command.get_program(), "/usr/bin/sudo");
         assert_eq!(command.get_args().take(2).collect::<Vec<_>>(), ["-n", "--"]);
+    }
+
+    #[test]
+    fn accepted_control_stream_blocks_instead_of_returning_would_block() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        stream.set_nonblocking(false).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let reader = stream.try_clone().unwrap();
+        thread::spawn(move || {
+            let mut line = String::new();
+            let result = BufReader::new(reader).read_line(&mut line);
+            let _ = tx.send(result.map(|_| line));
+        });
+
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "Reader must block instead of failing with WouldBlock/EAGAIN"
+        );
+        control::send(&mut client, &Message::Stopped).unwrap();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_ok());
     }
 }

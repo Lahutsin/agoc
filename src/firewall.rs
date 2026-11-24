@@ -2,11 +2,23 @@
 use crate::LEASE_SECONDS;
 use crate::{executable, Policy};
 use anyhow::{bail, Context, Result};
+#[cfg(any(target_os = "macos", test))]
+use std::collections::BTreeSet;
 use std::{
     fs::{File, OpenOptions},
     io::Write,
     process::{Command, Stdio},
 };
+#[cfg(any(target_os = "macos", test))]
+use std::net::IpAddr;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
+
+#[cfg(target_os = "macos")]
+const PF_TOKEN_PATH: &str = "/var/run/agoc.pf-token";
+
+#[cfg(target_os = "macos")]
+static LAST_APPLIED: Mutex<Option<Policy>> = Mutex::new(None);
 
 pub(crate) fn lock() -> Result<File> {
     #[cfg(unix)]
@@ -21,7 +33,11 @@ pub(crate) fn lock() -> Result<File> {
     Ok(file)
 }
 
-fn execute(program: &std::path::Path, args: &[&str], input: &str) -> Result<String> {
+fn execute_output(
+    program: &std::path::Path,
+    args: &[&str],
+    input: &str,
+) -> Result<(String, String)> {
     let mut child = Command::new(program)
         .args(args)
         .stdin(Stdio::piped())
@@ -43,7 +59,14 @@ fn execute(program: &std::path::Path, args: &[&str], input: &str) -> Result<Stri
         );
     }
     write_result?;
-    Ok(String::from_utf8(output.stdout)?)
+    Ok((
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?,
+    ))
+}
+
+fn execute(program: &std::path::Path, args: &[&str], input: &str) -> Result<String> {
+    Ok(execute_output(program, args, input)?.0)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -143,27 +166,157 @@ pub(crate) fn uninstall_if_present() -> Result<()> {
             return Ok(());
         }
     }
+    #[cfg(target_os = "macos")]
+    {
+        let pf = executable(&["/sbin/pfctl"])?;
+        let has_rules = !execute(&pf, &["-a", "agoc", "-sr"], "")
+            .unwrap_or_default()
+            .trim()
+            .is_empty();
+        let has_tables = !execute(&pf, &["-a", "agoc", "-sT"], "")
+            .unwrap_or_default()
+            .trim()
+            .is_empty();
+        let has_token = std::path::Path::new(PF_TOKEN_PATH).exists();
+        if !has_rules && !has_tables && !has_token {
+            eprintln!("AGOC PF rules are already absent");
+            return Ok(());
+        }
+    }
     uninstall()
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_pf_token(output: &str) -> Option<String> {
+    for line in output.lines() {
+        if let Some(rest) = line.trim().strip_prefix("Token") {
+            if let Some(token) = rest.trim_start().strip_prefix(':') {
+                let token = token.trim();
+                if !token.is_empty() && token.bytes().all(|b| b.is_ascii_digit()) {
+                    return Some(token.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_pf_rules(rules: &str) -> Result<()> {
+    for raw in rules.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with("scrub ") || line.starts_with("scrub-anchor ") {
+            continue;
+        }
+        if line == "anchor \"agoc\" all" || line == "anchor \"agoc\"" {
+            return Ok(());
+        }
+        if line == "anchor \"com.apple/*\" all" || line == "anchor \"com.apple/*\"" {
+            continue;
+        }
+        bail!("PF filter rule before anchor \"agoc\" may bypass blocking: {line}");
+    }
+    bail!("Active PF ruleset is missing anchor \"agoc\"; add it to /etc/pf.conf and reload PF (see README)");
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn ips_to_kill(previous: Option<&Policy>, current: &Policy) -> BTreeSet<IpAddr> {
+    let mut kill = BTreeSet::new();
+    for &ip in &current.addresses {
+        let blocked = if ip.is_ipv4() {
+            !current.allow4
+        } else {
+            !current.allow6
+        };
+        if !blocked {
+            continue;
+        }
+        let needs_kill = match previous {
+            None => true,
+            Some(prev) => {
+                let was_allowed = if ip.is_ipv4() {
+                    prev.allow4
+                } else {
+                    prev.allow6
+                };
+                was_allowed || !prev.addresses.contains(&ip)
+            }
+        };
+        if needs_kill {
+            kill.insert(ip);
+        }
+    }
+    kill
+}
+
 #[cfg(target_os = "macos")]
-pub(crate) fn prepare() -> Result<()> {
-    let pf = executable(&["/sbin/pfctl"])?;
-    let status = execute(&pf, &["-s", "info"], "")?;
+fn read_pf_token() -> Option<String> {
+    let content = std::fs::read_to_string(PF_TOKEN_PATH).ok()?;
+    let token = content.trim();
+    (!token.is_empty() && token.bytes().all(|b| b.is_ascii_digit())).then(|| token.to_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn write_pf_token(token: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(PF_TOKEN_PATH);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(PF_TOKEN_PATH)
+        .with_context(|| format!("Cannot create {PF_TOKEN_PATH}"))?;
+    writeln!(file, "{token}")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn pf_has_reference(pf: &std::path::Path, token: &str) -> bool {
+    execute(pf, &["-s", "References"], "")
+        .ok()
+        .is_some_and(|refs| {
+            refs.lines()
+                .any(|line| line.split_whitespace().any(|word| word == token))
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn ensure_pf_enabled(pf: &std::path::Path) -> Result<()> {
+    let status = execute(pf, &["-s", "info"], "")?;
+    let enabled = status
+        .lines()
+        .any(|line| line.starts_with("Status: Enabled"));
+    if enabled {
+        if let Some(token) = read_pf_token() {
+            if pf_has_reference(pf, &token) {
+                return Ok(());
+            }
+        }
+    }
+    let (stdout, stderr) = execute_output(pf, &["-E"], "")?;
+    let combined = format!("{stdout}\n{stderr}");
+    if let Some(token) = parse_pf_token(&combined) {
+        write_pf_token(&token)?;
+    }
+    let status = execute(pf, &["-s", "info"], "")?;
     if !status
         .lines()
         .any(|line| line.starts_with("Status: Enabled"))
     {
-        bail!("PF is disabled; configure /etc/pf.conf and enable PF first (see README)");
+        bail!("Cannot enable PF with pfctl -E");
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn prepare() -> Result<()> {
+    *LAST_APPLIED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let pf = executable(&["/sbin/pfctl"])?;
+    ensure_pf_enabled(&pf)?;
     let rules = execute(&pf, &["-sr"], "")?;
-    let first = rules
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("");
-    if first != "anchor \"agoc\" all" && first != "anchor \"agoc\"" {
-        bail!("The FIRST active PF filter rule must be anchor \"agoc\" (see README)");
-    }
+    validate_pf_rules(&rules)?;
     Ok(())
 }
 
@@ -171,24 +324,28 @@ pub(crate) fn prepare() -> Result<()> {
 pub(crate) fn apply(policy: &Policy) -> Result<()> {
     let pf = executable(&["/sbin/pfctl"])?;
     execute(&pf, &["-a", "agoc", "-f", "-"], &pf_rules(policy))?;
-    // PF checks existing states before rules. Kill only states for blocked addresses.
-    for ip in &policy.addresses {
-        if if ip.is_ipv4() {
-            !policy.allow4
-        } else {
-            !policy.allow6
-        } {
-            let any = if ip.is_ipv4() { "0.0.0.0/0" } else { "::/0" };
-            execute(&pf, &["-k", any, "-k", &ip.to_string()], "")?;
-        }
+    let mut guard = LAST_APPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    let kill = ips_to_kill(guard.as_ref(), policy);
+    // PF checks existing states before rules. Kill states for newly blocked or newly added IPs.
+    for ip in kill {
+        let any = if ip.is_ipv4() { "0.0.0.0/0" } else { "::/0" };
+        execute(&pf, &["-k", any, "-k", &ip.to_string()], "")?;
     }
+    *guard = Some(policy.clone());
     Ok(())
 }
 
 #[cfg(target_os = "macos")]
 pub(crate) fn uninstall() -> Result<()> {
+    *LAST_APPLIED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let pf = executable(&["/sbin/pfctl"])?;
     execute(&pf, &["-a", "agoc", "-F", "all"], "")?;
+    if let Some(token) = read_pf_token() {
+        let _ = std::fs::remove_file(PF_TOKEN_PATH);
+        if let Err(error) = execute(&pf, &["-X", &token], "") {
+            eprintln!("Note: pfctl -X {token}: {error:#}");
+        }
+    }
     Ok(())
 }
 
@@ -256,6 +413,62 @@ mod tests {
         policy.block();
         assert!(!nft_rules(&policy).contains("timeout 30s"));
         assert_eq!(pf_rules(&policy).matches("block drop out quick").count(), 2);
+    }
+
+    #[test]
+    fn parses_pf_enable_tokens() {
+        assert_eq!(
+            parse_pf_token("pf enabled\nToken : 12345678901234567\n").as_deref(),
+            Some("12345678901234567")
+        );
+        assert_eq!(parse_pf_token("pf enabled\n"), None);
+        assert_eq!(parse_pf_token("Token : not-a-number\n"), None);
+    }
+
+    #[test]
+    fn validates_pf_anchor_ordering_with_apple_rules() {
+        let first = "scrub-anchor \"com.apple/*\" all fragment reassemble\n\
+            anchor \"agoc\" all\n\
+            anchor \"com.apple/*\" all\n";
+        assert!(validate_pf_rules(first).is_ok());
+
+        let after_apple = "scrub-anchor \"com.apple/*\" all fragment reassemble\n\
+            anchor \"com.apple/*\" all\n\
+            anchor \"agoc\" all\n";
+        assert!(validate_pf_rules(after_apple).is_ok());
+
+        let missing = "scrub-anchor \"com.apple/*\" all\nanchor \"com.apple/*\" all\n";
+        assert!(validate_pf_rules(missing).is_err());
+
+        let bypassed = "pass out quick all\nanchor \"agoc\" all\n";
+        assert!(validate_pf_rules(bypassed).is_err());
+    }
+
+    #[test]
+    fn kills_states_only_for_newly_blocked_or_new_ips() {
+        let ip4a: IpAddr = "198.51.100.8".parse().unwrap();
+        let ip4b: IpAddr = "198.51.100.9".parse().unwrap();
+        let ip6a: IpAddr = "2001:db8::8".parse().unwrap();
+
+        let p1 = Policy {
+            addresses: [ip4a, ip6a].into(),
+            allow4: false,
+            allow6: false,
+        };
+        assert_eq!(ips_to_kill(None, &p1), [ip4a, ip6a].into());
+        assert!(ips_to_kill(Some(&p1), &p1).is_empty());
+
+        let mut p2 = p1.clone();
+        p2.addresses.insert(ip4b);
+        assert_eq!(ips_to_kill(Some(&p1), &p2), [ip4b].into());
+
+        let mut p3 = p2.clone();
+        p3.allow4 = true;
+        assert!(ips_to_kill(Some(&p2), &p3).is_empty());
+
+        let mut p4 = p3.clone();
+        p4.allow4 = false;
+        assert_eq!(ips_to_kill(Some(&p3), &p4), [ip4a, ip4b].into());
     }
 
     #[cfg(target_os = "linux")]

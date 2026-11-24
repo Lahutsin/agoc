@@ -343,6 +343,7 @@ struct Guardian {
     input: Option<std::process::ChildStdin>,
     output: BufReader<std::process::ChildStdout>,
     last: Policy,
+    dead: bool,
 }
 
 impl Guardian {
@@ -357,29 +358,47 @@ impl Guardian {
             output: BufReader::new(child.stdout.take().context("No guardian stdout")?),
             child,
             last: Policy::default(),
+            dead: false,
         })
     }
 
     fn apply(&mut self, policy: &Policy) -> Result<()> {
         self.last = policy.clone();
         let input = self.input.as_mut().context("Guardian input closed")?;
-        input.write_all(policy.encode().as_bytes())?;
-        input.flush()?;
+        if let Err(error) = input
+            .write_all(policy.encode().as_bytes())
+            .and_then(|()| input.flush())
+        {
+            self.dead = true;
+            let mut reply = String::new();
+            if self.output.read_line(&mut reply).is_ok() {
+                if let Some(message) = reply.strip_prefix("ERR ") {
+                    bail!("{}", message.trim_end());
+                }
+            }
+            return Err(error.into());
+        }
         let mut reply = String::new();
         self.output.read_line(&mut reply)?;
-        if reply != "OK\n" {
-            bail!("Firewall guardian failed; see its stderr");
+        if reply == "OK\n" {
+            return Ok(());
         }
-        Ok(())
+        self.dead = true;
+        if let Some(message) = reply.strip_prefix("ERR ") {
+            bail!("{}", message.trim_end());
+        }
+        bail!("Firewall guardian failed; see its stderr");
     }
 }
 
 impl Drop for Guardian {
     fn drop(&mut self) {
-        let mut blocked = self.last.clone();
-        blocked.block();
-        if let Err(error) = self.apply(&blocked) {
-            eprintln!("ERROR restoring block: {error:#}");
+        if !self.dead {
+            let mut blocked = self.last.clone();
+            blocked.block();
+            if let Err(error) = self.apply(&blocked) {
+                eprintln!("ERROR restoring block: {error:#}");
+            }
         }
         self.input.take();
         match self.child.wait() {
@@ -389,7 +408,22 @@ impl Drop for Guardian {
     }
 }
 
+fn send_guardian_error(error: &anyhow::Error) {
+    let summary = format!("{error:#}").replace(['\r', '\n'], " ");
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "ERR {summary}");
+    let _ = stdout.flush();
+}
+
 fn guard() -> Result<()> {
+    let result = guard_inner();
+    if let Err(ref error) = result {
+        send_guardian_error(error);
+    }
+    result
+}
+
+fn guard_inner() -> Result<()> {
     require_root()?;
     let _lock = firewall::lock()?;
     // Terminal signals reach both processes; the parent closes IPC after cleanup.
@@ -458,6 +492,9 @@ fn monitor_inner(
     let mut guardian = Guardian::start()?;
     let mut policy = Policy::default();
     let mut status = NetworkStatus::default();
+    let mut last_error: Option<String> = None;
+    let mut last_v4_error: Option<String> = None;
+    let mut last_v6_error: Option<String> = None;
     let domains: BTreeSet<_> = DEFAULT_DOMAINS
         .iter()
         .map(|host| host.to_string())
@@ -500,8 +537,11 @@ fn monitor_inner(
             status.ipv6 = FamilyStatus::default();
         }
         status.error = (!errors.is_empty()).then(|| errors.join("; "));
-        if let Some(error) = &status.error {
-            eprintln!("{error}");
+        if status.error != last_error {
+            if let Some(error) = &status.error {
+                eprintln!("{error}");
+            }
+            last_error = status.error.clone();
         }
         guardian.apply(&policy)?;
         report(&mut control, &policy, &status)?;
@@ -529,8 +569,11 @@ fn monitor_inner(
             }
         };
         status.ipv4 = check(false);
-        if let Some(error) = &status.ipv4.error {
-            eprintln!("IPv4: {error}");
+        if status.ipv4.error != last_v4_error {
+            if let Some(error) = &status.ipv4.error {
+                eprintln!("IPv4: {error}");
+            }
+            last_v4_error = status.ipv4.error.clone();
         }
         policy.allow4 = dns_ok && status.ipv4.changed();
         guardian.apply(&policy)?;
@@ -539,8 +582,11 @@ fn monitor_inner(
             break;
         }
         status.ipv6 = check(true);
-        if let Some(error) = &status.ipv6.error {
-            eprintln!("IPv6: {error}");
+        if status.ipv6.error != last_v6_error {
+            if let Some(error) = &status.ipv6.error {
+                eprintln!("IPv6: {error}");
+            }
+            last_v6_error = status.ipv6.error.clone();
         }
         policy.allow6 = dns_ok && status.ipv6.changed();
         if !active(&control) {

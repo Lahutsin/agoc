@@ -172,5 +172,5 @@ chmod 0600 "$autostart"
 printf '\nInstalled. Log out and log in to start automatically.\n'
 printf 'Start now (as your user, without sudo):\n  %s/agoc-tray --installed-helper\n' "$destination"
 if [[ "$platform" == macos ]]; then
-    printf 'Configure and enable PF first; see the macOS PF setup section in README.md.\n'
+    printf 'Ensure anchor "agoc" is configured in /etc/pf.conf; see the macOS PF setup section in README.md.\n'
 fi

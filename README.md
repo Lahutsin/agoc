@@ -59,7 +59,7 @@ binary does not run on macOS. For a CLI-only build, omit `--features tray`.
 
 - The built-in `pfctl`, `osascript`, `networksetup`, `netstat`, and `ifconfig`,
   plus administrator access. HTTPS uses the native system TLS implementation.
-- A configured, enabled PF firewall; see [macOS PF setup](#macos-pf-setup).
+- `anchor "agoc"` configured in `/etc/pf.conf`; see [macOS PF setup](#macos-pf-setup).
 
 ## Automatic original-IP detection
 
@@ -326,13 +326,14 @@ while the VPN is enabled. Failed automatic checks never fall back to this mode.
 
 ## macOS PF setup
 
-AGOC does not overwrite the main PF configuration or enable/disable PF.
-Configure it once before running the monitor or tray:
+AGOC does not overwrite `/etc/pf.conf`, so configure `anchor "agoc"` once before
+running the monitor or tray:
 
 1. Back up `/etc/pf.conf`.
 2. Add `anchor "agoc"` as the **first filter rule**, before other
-   `anchor`/`pass`/`block` rules. Keep options, normalization, and translation
-   sections before filter rules, as required by PF.
+   `anchor`/`pass`/`block` rules (normalization rules like `scrub-anchor` stay
+   before filter rules, as required by PF; `anchor "com.apple/*"` before
+   `anchor "agoc"` is also accepted).
 3. Validate and load your configuration:
 
    ```sh
@@ -340,11 +341,9 @@ Configure it once before running the monitor or tray:
    sudo pfctl -f /etc/pf.conf
    ```
 
-4. If PF is disabled, enable it:
-
-   ```sh
-   sudo pfctl -E
-   ```
+When AGOC starts on macOS, it automatically enables PF with a reference token
+(`pfctl -E`) if needed, so you do not have to run `pfctl -E` manually after
+every reboot.
 
 Reloading PF affects the system firewall. Coordinate with existing network
 tools; do not blindly use `pfctl -d`, which disables system-wide protection.
@@ -352,7 +351,8 @@ Interfaces excluded with `set skip` are not filtered.
 
 AGOC only updates its own `agoc` anchor. It removes states for blocked
 destinations because PF checks established states before evaluating rules.
-Tray Quit empties this anchor; it does not disable PF or edit `/etc/pf.conf`.
+Tray Quit and `agoc uninstall` empty this anchor and release only AGOC's own PF
+enable reference (`pfctl -X`), leaving `/etc/pf.conf` untouched.
 
 On Linux, AGOC owns only `table inet agoc`, uses transactional updates,
 and filters local outgoing packets, including established connections.
