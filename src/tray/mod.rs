@@ -52,6 +52,8 @@ enum Event {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Color {
     Waiting,
+    /// The app itself failed (helper, authorization, monitor): nothing works.
+    Error,
     Blocked,
     Allowed,
     Partial,
@@ -149,7 +151,7 @@ impl View {
                 eprintln!("ERROR: {message}");
                 self.label = fit(&format!("Error: {}", reason(&message)));
                 self.details[2] = "Rules may remain; see README".into();
-                self.color = Color::Blocked;
+                self.color = Color::Error;
                 self.failed = true;
                 self.quitting = false;
             }
@@ -220,116 +222,133 @@ fn family_row(family: &crate::network::FamilyStatus, name: &str, allowed: bool) 
     })
 }
 
-/// Pre-rendered, pixel-hinted tray artwork from `icon/gen_icon.py`, one PNG per size.
+/// Pre-rendered, pixel-hinted tray artwork from `icon/gen_icon.py`, per size:
+/// the frame (rounded square, without the globe) and the globe coverage mask.
 /// Each size is used as-is: resampling one big image at runtime is what made small
 /// tray icons blurry. Linux hosts pick the closest size for their panel and scale;
 /// macOS uses `macos::ICON_SIZE`.
-const ARTWORK: &[(u32, &[u8])] = &[
-    (16, include_bytes!("../../icon/tray/tray-16.png")),
-    (18, include_bytes!("../../icon/tray/tray-18.png")),
-    (20, include_bytes!("../../icon/tray/tray-20.png")),
-    (22, include_bytes!("../../icon/tray/tray-22.png")),
-    (24, include_bytes!("../../icon/tray/tray-24.png")),
-    (32, include_bytes!("../../icon/tray/tray-32.png")),
-    (36, include_bytes!("../../icon/tray/tray-36.png")),
-    (40, include_bytes!("../../icon/tray/tray-40.png")),
-    (44, include_bytes!("../../icon/tray/tray-44.png")),
-    (48, include_bytes!("../../icon/tray/tray-48.png")),
-    (64, include_bytes!("../../icon/tray/tray-64.png")),
+const ARTWORK: &[(u32, &[u8], &[u8])] = &[
+    (
+        16,
+        include_bytes!("../../icon/tray/tray-16.png"),
+        include_bytes!("../../icon/tray/globe-16.png"),
+    ),
+    (
+        18,
+        include_bytes!("../../icon/tray/tray-18.png"),
+        include_bytes!("../../icon/tray/globe-18.png"),
+    ),
+    (
+        20,
+        include_bytes!("../../icon/tray/tray-20.png"),
+        include_bytes!("../../icon/tray/globe-20.png"),
+    ),
+    (
+        22,
+        include_bytes!("../../icon/tray/tray-22.png"),
+        include_bytes!("../../icon/tray/globe-22.png"),
+    ),
+    (
+        24,
+        include_bytes!("../../icon/tray/tray-24.png"),
+        include_bytes!("../../icon/tray/globe-24.png"),
+    ),
+    (
+        32,
+        include_bytes!("../../icon/tray/tray-32.png"),
+        include_bytes!("../../icon/tray/globe-32.png"),
+    ),
+    (
+        36,
+        include_bytes!("../../icon/tray/tray-36.png"),
+        include_bytes!("../../icon/tray/globe-36.png"),
+    ),
+    (
+        40,
+        include_bytes!("../../icon/tray/tray-40.png"),
+        include_bytes!("../../icon/tray/globe-40.png"),
+    ),
+    (
+        44,
+        include_bytes!("../../icon/tray/tray-44.png"),
+        include_bytes!("../../icon/tray/globe-44.png"),
+    ),
+    (
+        48,
+        include_bytes!("../../icon/tray/tray-48.png"),
+        include_bytes!("../../icon/tray/globe-48.png"),
+    ),
+    (
+        64,
+        include_bytes!("../../icon/tray/tray-64.png"),
+        include_bytes!("../../icon/tray/globe-64.png"),
+    ),
 ];
 
-/// One decoded artwork size: `size` x `size` RGBA pixels.
+/// One decoded artwork size: `size` x `size` RGBA frame pixels and the globe mask
+/// (one coverage byte per pixel).
 #[derive(Clone)]
 struct Artwork {
     size: u32,
     rgba: Vec<u8>,
+    globe: Vec<u8>,
 }
 
 fn artwork() -> Result<Vec<Artwork>> {
     ARTWORK
         .iter()
-        .map(|&(size, png)| {
-            let image = image::load_from_memory_with_format(png, image::ImageFormat::Png)
+        .map(|&(size, frame, globe)| {
+            let frame = image::load_from_memory_with_format(frame, image::ImageFormat::Png)
                 .with_context(|| format!("Cannot decode embedded {size}px tray icon"))?
                 .to_rgba8();
-            if image.dimensions() != (size, size) {
+            let globe = image::load_from_memory_with_format(globe, image::ImageFormat::Png)
+                .with_context(|| format!("Cannot decode embedded {size}px globe mask"))?
+                .to_luma8();
+            if frame.dimensions() != (size, size) || globe.dimensions() != (size, size) {
                 bail!(
-                    "Embedded {size}px tray icon has size {:?}",
-                    image.dimensions()
+                    "Embedded {size}px tray icon has size {:?} / {:?}",
+                    frame.dimensions(),
+                    globe.dimensions()
                 );
             }
             Ok(Artwork {
                 size,
-                rgba: image.into_raw(),
+                rgba: frame.into_raw(),
+                globe: globe.into_raw(),
             })
         })
         .collect()
 }
 
-/// Status dot geometry for one icon size: (radius, ring width, first row/column it
-/// can touch). The dot is about half the icon wide and touches the bottom-right
-/// corner; the radius is a whole number of pixels so its edges land on the pixel
-/// grid and stay sharp.
-fn badge(size: u32) -> (f32, f32, u32) {
-    let radius = size / 4;
-    let ring = (size as f32 / 16.0).round().max(1.0);
-    (radius as f32, ring, size - 2 * radius)
+/// Status color of the globe: green when everything works, red when blocked,
+/// gray while starting or when the app itself failed.
+fn status_rgb(color: Color) -> [u8; 3] {
+    match color {
+        Color::Waiting | Color::Error => [170, 180, 190],
+        Color::Blocked => [255, 80, 80],
+        Color::Allowed => [60, 220, 110],
+        Color::Partial => [255, 185, 40],
+    }
 }
 
+/// The frame with the globe painted in the status color through its mask.
 fn pixels(art: &Artwork, color: Color) -> Vec<u8> {
-    let rgb = match color {
-        Color::Waiting => [130, 140, 150],
-        Color::Blocked => [220, 55, 55],
-        Color::Allowed => [45, 190, 90],
-        Color::Partial => [235, 170, 35],
-    };
-    // Green and red get a black ring (red on the shield and on light panels reads
-    // better with it); gray and amber keep a white ring.
-    let ring = if matches!(color, Color::Allowed | Color::Blocked) {
-        [0, 0, 0]
-    } else {
-        [255, 255, 255]
-    };
-    // Status dot in the bottom-right corner: colored disc with a contrasting ring,
-    // anti-aliased with 4x4 supersampling and blended over the artwork.
-    const SAMPLES: u32 = 4;
-    let size = art.size;
-    let (radius, ring_width, top) = badge(size);
-    let center = size as f32 - radius;
-    let inner = radius - ring_width;
+    let rgb = status_rgb(color);
     let mut rgba = art.rgba.clone();
-    for y in top..size {
-        for x in top..size {
-            let (mut in_outer, mut in_inner) = (0u32, 0u32);
-            for sy in 0..SAMPLES {
-                for sx in 0..SAMPLES {
-                    let dx = x as f32 + (sx as f32 + 0.5) / SAMPLES as f32 - center;
-                    let dy = y as f32 + (sy as f32 + 0.5) / SAMPLES as f32 - center;
-                    let distance = dx * dx + dy * dy;
-                    if distance <= radius * radius {
-                        in_outer += 1;
-                        if distance <= inner * inner {
-                            in_inner += 1;
-                        }
-                    }
-                }
-            }
-            if in_outer == 0 {
-                continue;
-            }
-            let offset = ((y * size + x) * 4) as usize;
-            let alpha = in_outer as f32 / (SAMPLES * SAMPLES) as f32;
-            let fill = in_inner as f32 / in_outer as f32;
-            let dst_alpha = rgba[offset + 3] as f32 / 255.0;
-            let out_alpha = alpha + dst_alpha * (1.0 - alpha);
-            for channel in 0..3 {
-                let badge = rgb[channel] as f32 * fill + ring[channel] as f32 * (1.0 - fill);
-                let under = rgba[offset + channel] as f32;
-                let value = (badge * alpha + under * dst_alpha * (1.0 - alpha)) / out_alpha;
-                rgba[offset + channel] = value.round() as u8;
-            }
-            rgba[offset + 3] = (out_alpha * 255.0).round() as u8;
+    for (pixel, &coverage) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(&art.globe) {
+        if coverage == 0 {
+            continue;
         }
+        let alpha = coverage as f32 / 255.0;
+        let dst_alpha = pixel[3] as f32 / 255.0;
+        let out_alpha = alpha + dst_alpha * (1.0 - alpha);
+        for channel in 0..3 {
+            let under = pixel[channel] as f32;
+            let value =
+                (rgb[channel] as f32 * alpha + under * dst_alpha * (1.0 - alpha)) / out_alpha;
+            pixel[channel] = value.round() as u8;
+        }
+        pixel[3] = (out_alpha * 255.0).round() as u8;
     }
     rgba
 }
@@ -676,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_artwork_is_visible_and_preserved_outside_status_badge() {
+    fn embedded_artwork_is_visible_and_only_the_globe_is_recolored() {
         let all = artwork().unwrap();
         assert_eq!(
             all.iter().map(|art| art.size).collect::<Vec<_>>(),
@@ -685,39 +704,33 @@ mod tests {
         for art in &all {
             let size = art.size;
             assert_eq!(art.rgba.len(), (size * size * 4) as usize);
-            // Opaque blue shield rim exists at every size.
-            assert!(art
-                .rgba
-                .as_chunks::<4>()
-                .0
+            assert_eq!(art.globe.len(), (size * size) as usize);
+            let frame = art.rgba.as_chunks::<4>().0;
+            // Opaque blue rim exists at every size.
+            assert!(frame
                 .iter()
                 .any(|pixel| pixel[3] == 255 && pixel[2] > 200 && pixel[0] < 100));
-            let (radius, _, top) = badge(size);
-            let middle = size - radius as u32;
-            let offset = ((middle * size + middle) * 4) as usize;
-            for (color, rgb) in [
-                (Color::Waiting, [130, 140, 150]),
-                (Color::Blocked, [220, 55, 55]),
-                (Color::Allowed, [45, 190, 90]),
-                (Color::Partial, [235, 170, 35]),
+            // Fully covered globe pixels exist and lie on the opaque body.
+            let solid: Vec<_> = (0..frame.len()).filter(|&i| art.globe[i] == 255).collect();
+            assert!(!solid.is_empty(), "{size}px");
+            assert!(solid.iter().all(|&i| frame[i][3] == 255), "{size}px");
+            for color in [
+                Color::Waiting,
+                Color::Error,
+                Color::Blocked,
+                Color::Allowed,
+                Color::Partial,
             ] {
+                let rgb = status_rgb(color);
                 let rendered = pixels(art, color);
-                // Everything above the dot is untouched artwork.
-                let row = (top * size * 4) as usize;
-                assert_eq!(&rendered[..row], &art.rgba[..row], "{size}px");
-                // Just inside the dot's left edge is ring: black for green and red, white otherwise.
-                let ring = ((middle * size + top) * 4) as usize;
-                let ring_rgb = if matches!(color, Color::Allowed | Color::Blocked) {
-                    [0, 0, 0]
-                } else {
-                    [255, 255, 255]
-                };
-                assert_eq!(&rendered[ring..ring + 3], &ring_rgb, "{size}px");
-                assert_eq!(
-                    &rendered[offset..offset + 4],
-                    &[rgb[0], rgb[1], rgb[2], 255],
-                    "{size}px"
-                );
+                let rendered = rendered.as_chunks::<4>().0;
+                for i in 0..frame.len() {
+                    match art.globe[i] {
+                        0 => assert_eq!(rendered[i], frame[i], "{size}px"),
+                        255 => assert_eq!(rendered[i], [rgb[0], rgb[1], rgb[2], 255], "{size}px"),
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -780,6 +793,7 @@ mod tests {
         view.event(Event::Failed(long_error.repeat(5)), &worker)
             .unwrap();
         assert_eq!(view.label, "Error: Network is unreachable");
+        assert_eq!(view.color, Color::Error);
         for row in std::iter::once(&view.label).chain(&view.details) {
             assert!(row.chars().count() <= MENU_WIDTH, "{row}");
         }

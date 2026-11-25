@@ -118,10 +118,11 @@ a Unix socket in a private, permission-restricted temporary directory.
 
 ### Tray indicator and menu
 
-The tray artwork (a shield with a globe) is pre-rendered for each size by
-`icon/gen_icon.py` into `icon/tray/tray-<N>.png`, with lines snapped to the
-pixel grid, and embedded in the tray binary, so no external image file is
-needed at runtime and nothing is resampled:
+The tray artwork (a rounded square with a globe) is pre-rendered for each size
+by `icon/gen_icon.py` into `icon/tray/tray-<N>.png` (the frame) and
+`icon/tray/globe-<N>.png` (the globe mask), with lines snapped to the pixel
+grid, and embedded in the tray binary, so no external image file is needed at
+runtime and nothing is resampled:
 
 - **Linux:** all sizes (16-64 px) are offered; the StatusNotifier host picks
   the one matching its panel size and HiDPI scale.
@@ -130,15 +131,14 @@ needed at runtime and nothing is resampled:
 - **Windows** is not supported by the app; 16/20/24/32/40/48 px are generated
   for a future port (100-300 % scaling).
 
-`icon/icon.png` is the same artwork at 1024 px. To change the icon, edit and run
-`python3 icon/gen_icon.py` (Pillow), then rebuild. A colored dot (about half the
-icon's width) in the bottom-right corner shows the connection state over the
-artwork.
+`icon/icon.png` is the same artwork at 1024 px (with a green globe). To change
+the icon, edit and run `python3 icon/gen_icon.py` (Pillow), then rebuild.
+The globe itself is colored by the connection state:
 
 | Color | Meaning |
 |-------|---------|
-| Gray | Starting / waiting for authorization |
-| Red | Both families blocked, or an error; read the menu status |
+| Gray | Starting / waiting for authorization, or the app failed (helper, authorization or monitor error); read the menu status |
+| Red | Both families blocked (IP unchanged, unknown or the network check failed) |
 | Amber | One family allowed, the other blocked although it is reachable |
 | Green | Both IPv4 and IPv6 allowed, or IPv4 allowed and the current route has no IPv6 |
 
@@ -155,7 +155,7 @@ each family changed, its actual permission, and the direct interface/errors.
 Rows are kept to at most 60 characters: long IPv6 addresses are shortened
 (`2a01:4f8:c0c:…:1234`) and errors show only the root cause (for example
 `Network is unreachable`). The full error text is still written to stderr by the monitor and the tray.
-When IPv4 changed and the current route has no public IPv6, the dot is green:
+When IPv4 changed and the current route has no public IPv6, the globe is green:
 all traffic leaves over IPv4. Amber means IPv6 is reachable but unchanged or
 not verified. In both cases IPv6 stays blocked in the firewall. "OK to use" only refers to the verified allowed families
 and known destination IPs, not a no-leak guarantee.

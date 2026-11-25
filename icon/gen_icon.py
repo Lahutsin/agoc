@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
-"""AGOC icon generator: shield (gate) + globe (public IP). Original geometric artwork.
+"""AGOC icon generator: rounded square (gate) + globe (public IP). Original geometric artwork.
 
 Each tray size is drawn separately with its geometry snapped to the pixel grid
 (integer stroke widths, straight edges on pixel boundaries), so the app never
 resamples the icon at runtime and small sizes stay sharp instead of blurry.
 
-    python3 icon/gen_icon.py        # writes icon/icon.png and icon/tray/tray-<N>.png
+    python3 icon/gen_icon.py        # writes icon/icon.png, icon/tray/tray-<N>.png
+                                    # and icon/tray/globe-<N>.png
+
+Per size, two files are written:
+  * tray-<N>.png  - the frame: blue rim + dark body, without the globe.
+  * globe-<N>.png - 8-bit coverage mask of the globe lines. The tray app paints
+    the globe in the status color (green/red/...) through this mask.
+icon/icon.png is the full artwork at 1024 px with a green globe (preview only).
 
 Sizes:
   * Linux (StatusNotifierItem): 16, 22, 24, 32, 44, 48, 64 - the tray host picks
@@ -15,7 +22,6 @@ Sizes:
 
 Requires Pillow only.
 """
-import math
 import os
 import sys
 
@@ -24,76 +30,18 @@ from PIL import Image, ImageChops, ImageDraw
 HERE = os.path.dirname(os.path.abspath(__file__))
 TRAY_SIZES = (16, 18, 20, 22, 24, 32, 36, 40, 44, 48, 64)
 
-RIM = (56, 152, 236)      # shield rim: blue, separates the icon from dark panels
-BODY = (18, 27, 43)       # shield body: dark navy, silhouette on light panels
-GLOBE = (226, 242, 255)   # globe lines: near white, maximum contrast on the body
-
-
-def shield(left, right, top, bottom, corner, steps=96):
-    """Flat top with rounded corners, vertical sides, sides curving into a point."""
-    cx = (left + right) / 2
-    shoulder = top + (bottom - top) * 0.48
-    pts = [(left, shoulder)]
-    for i in range(steps // 4 + 1):  # top-left corner, from the side to the top edge
-        a = math.pi - (math.pi / 2) * i / (steps // 4)
-        pts.append((left + corner + corner * math.cos(a), top + corner - corner * math.sin(a)))
-    for i in range(steps // 4 + 1):  # top-right corner, from the top edge to the side
-        a = math.pi / 2 - (math.pi / 2) * i / (steps // 4)
-        pts.append((right - corner + corner * math.cos(a), top + corner - corner * math.sin(a)))
-    pts.append((right, shoulder))
-    curve = top + (bottom - top) * 0.84
-    for p0, p1, p2 in (((right, shoulder), (right, curve), (cx, bottom)),
-                       ((cx, bottom), (left, curve), (left, shoulder))):
-        for i in range(1, steps + 1):
-            t = i / steps
-            pts.append(((1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * p1[0] + t ** 2 * p2[0],
-                        (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * p1[1] + t ** 2 * p2[1]))
-    return pts
-
-
-def inset(points, distance):
-    """Exact inward offset of a convex polygon: intersect the half-planes that lie
-    `distance` inside each edge (Sutherland-Hodgman clipping). Every point of the
-    result is at least `distance` from the outline, and the boundary is at exactly
-    that distance, so a rim drawn between the two has a uniform width."""
-    pts = [p for i, p in enumerate(points) if p != points[i - 1]]
-    cx = sum(x for x, _ in pts) / len(pts)
-    cy = sum(y for _, y in pts) / len(pts)
-    result = list(pts)
-    for (x1, y1), (x2, y2) in zip(pts, pts[1:] + pts[:1]):
-        dx, dy = x2 - x1, y2 - y1
-        length = math.hypot(dx, dy)
-        if length < 1e-9:
-            continue
-        nx, ny = -dy / length, dx / length
-        if nx * (cx - x1) + ny * (cy - y1) < 0:   # make the normal point inwards
-            nx, ny = -nx, -ny
-        offset = nx * x1 + ny * y1 + distance       # keep points with n.p >= offset
-
-        def side(point):
-            return nx * point[0] + ny * point[1] - offset
-
-        clipped = []
-        for a, b in zip(result, result[1:] + result[:1]):
-            sa, sb = side(a), side(b)
-            if sa >= 0:
-                clipped.append(a)
-            if (sa >= 0) != (sb >= 0):
-                t = sa / (sa - sb)
-                clipped.append((a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t))
-        result = clipped
-    return result
+RIM = (56, 152, 236)      # rim: blue, separates the icon from dark panels
+BODY = (18, 27, 43)       # body: dark navy, silhouette on light panels
+PREVIEW = (60, 220, 110)  # globe color in icon.png (the "allowed" status color)
 
 
 def render(size):
+    """Returns (frame RGBA, globe mask L), both size x size."""
     ss = max(4, 256 // size)  # supersampling; box downsampling = exact pixel coverage
     hi = size * ss
 
     def new():
         return Image.new("L", (hi, hi), 0)
-
-    def poly(points):
-        return [(x * ss, y * ss) for x, y in points]
 
     def box(cx, cy, rx, ry):
         return [(cx - rx) * ss, (cy - ry) * ss, (cx + rx) * ss - 1, (cy + ry) * ss - 1]
@@ -101,26 +49,25 @@ def render(size):
     # Pixel-snapped geometry (output pixels).
     rim = max(1, round(size * 0.07))
     line = max(1, round(size * 0.06))
-    margin = max(1, round(size * 0.07))
     half = (line % 2) / 2                 # odd strokes are centred on pixel centres
-    # The vertical axis must sit on a pixel centre for odd strokes and on a pixel
-    # boundary for even ones; if the canvas centre does not, shift the whole
-    # shield half a pixel left (its width becomes odd) instead of blurring lines.
+    # The globe axes must sit on a pixel centre for odd strokes and on a pixel
+    # boundary for even ones; if the canvas centre does not, shrink the square by
+    # one pixel (its side becomes odd) instead of blurring the lines.
     shift = 0.5 if ((size / 2) % 1 != half) else 0.0
-    cx = size / 2 - shift
-    left, right = margin, size - margin - 2 * shift
-    top, bottom = max(0, round(size * 0.04)), size
-    corner = max(1.0, size * 0.10)
-    radius = max(3, round(size * 0.24)) + half   # outer edge lands on a pixel boundary
-    cy = round(size * 0.44) + half
+    side = size - 2 * shift
+    cx = cy = side / 2
+    corner = max(1.0, size * 0.12)
+    radius = max(3, round(size * 0.30)) + half   # outer edge lands on a pixel boundary
 
-    outline = shield(left, right, top, bottom, corner)
     outer = new()
-    ImageDraw.Draw(outer).polygon(poly(outline), fill=255)
+    ImageDraw.Draw(outer).rounded_rectangle(
+        [0, 0, side * ss - 1, side * ss - 1], radius=corner * ss, fill=255)
     body = new()
-    # The body is the outline moved inwards by exactly `rim` everywhere, so the blue
-    # rim has the same thickness on the top, the sides, the curves and the point.
-    ImageDraw.Draw(body).polygon(poly(inset(outline, rim)), fill=255)
+    # The body is the square moved inwards by exactly `rim`, with the corner radius
+    # reduced by the same amount, so the rim has a uniform width everywhere.
+    ImageDraw.Draw(body).rounded_rectangle(
+        [rim * ss, rim * ss, (side - rim) * ss - 1, (side - rim) * ss - 1],
+        radius=max(0.0, corner - rim) * ss, fill=255)
 
     disc = new()
     ImageDraw.Draw(disc).ellipse(box(cx, cy, radius, radius), fill=255)
@@ -146,21 +93,24 @@ def render(size):
     ImageDraw.Draw(equator).rectangle(
         [(cx - radius) * ss, (cy - line / 2) * ss, (cx + radius) * ss - 1, (cy + line / 2) * ss - 1],
         fill=255)
-    globe = ImageChops.multiply(ImageChops.lighter(globe, equator), disc)
+    globe = ImageChops.multiply(ImageChops.multiply(ImageChops.lighter(globe, equator), disc), body)
 
-    img = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
-    img.paste(Image.new("RGBA", (hi, hi), RIM + (255,)), mask=outer)
-    img.paste(Image.new("RGBA", (hi, hi), BODY + (255,)), mask=body)
-    img.paste(Image.new("RGBA", (hi, hi), GLOBE + (255,)), mask=ImageChops.multiply(globe, body))
-    return img.resize((size, size), Image.BOX)
+    frame = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+    frame.paste(Image.new("RGBA", (hi, hi), RIM + (255,)), mask=outer)
+    frame.paste(Image.new("RGBA", (hi, hi), BODY + (255,)), mask=body)
+    return frame.resize((size, size), Image.BOX), globe.resize((size, size), Image.BOX)
 
 
 def main():
     out = sys.argv[1] if len(sys.argv) > 1 else HERE
     os.makedirs(os.path.join(out, "tray"), exist_ok=True)
     for size in TRAY_SIZES:
-        render(size).save(os.path.join(out, "tray", f"tray-{size}.png"), optimize=True)
-    render(1024).save(os.path.join(out, "icon.png"), optimize=True)
+        frame, globe = render(size)
+        frame.save(os.path.join(out, "tray", f"tray-{size}.png"), optimize=True)
+        globe.save(os.path.join(out, "tray", f"globe-{size}.png"), optimize=True)
+    frame, globe = render(1024)
+    frame.paste(Image.new("RGBA", frame.size, PREVIEW + (255,)), mask=globe)
+    frame.save(os.path.join(out, "icon.png"), optimize=True)
 
 
 if __name__ == "__main__":
