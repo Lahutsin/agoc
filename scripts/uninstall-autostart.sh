@@ -20,7 +20,54 @@ case $(uname -s) in
     *) fail "Only Linux and macOS are supported." ;;
 esac
 
-printf 'Choose Quit (remove protection) in the AGOC tray before uninstalling.\n'
+# PIDs of processes whose executable is exactly $1 (macOS: ps "comm" is the
+# executable path; Linux: /proc/<pid>/exe).
+process_pids() {
+    local executable="$1" process link
+    if [[ $(uname -s) == Darwin ]]; then
+        /bin/ps -axo pid=,comm= | awk -v executable="$executable" \
+            '$2 == executable { print $1 }' || true
+        return 0
+    fi
+    for process in /proc/[0-9]*; do
+        [[ -e "$process/exe" ]] || continue
+        link=$(readlink -- "$process/exe" 2>/dev/null) || continue
+        [[ "$link" == "$executable" ]] || continue
+        printf '%s\n' "${process##*/}"
+    done
+    return 0
+}
+
+# Terminate the tray, then wait until no tray, monitor or guardian process
+# from the installation directory remains: the monitor and its guardian exit
+# on their own once the tray's control socket closes, which frees the AGOC
+# lock for rule removal below.
+stop_agoc() {
+    local _
+    process_pids "$destination/agoc-tray" | while read -r pid; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for _ in {1..450}; do
+        if [[ -z $(process_pids "$destination/agoc-tray") && -z $(process_pids "$destination/agoc") ]]; then
+            return 0
+        fi
+        sleep 0.2
+    done
+    return 1
+}
+
+if [[ $(uname -s) == Darwin ]]; then
+    # Stop the login LaunchAgent and any tray started from the installation
+    # directory, so the monitor and its guardian exit before removal.
+    # Quitting the tray first is also fine.
+    printf 'Stopping the AGOC tray...\n'
+    if /bin/launchctl print "gui/$uid/dev.agoc.tray" >/dev/null 2>&1; then
+        /bin/launchctl bootout "gui/$uid/dev.agoc.tray" || true
+    fi
+    stop_agoc || fail "AGOC did not stop cleanly. Quit the tray and retry."
+else
+    printf 'Choose Quit (remove protection) in the AGOC tray before uninstalling.\n'
+fi
 sudo /bin/bash -s -- "$destination" "$uid" <<'ROOT'
 set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
@@ -53,11 +100,6 @@ visudo -c
 rm -- "$destination/agoc" "$destination/agoc-tray" "$destination/.managed"
 rmdir -- "$destination"
 ROOT
-if [[ $(uname -s) == Darwin ]]; then
-    if /bin/launchctl print "gui/$uid/dev.agoc.tray" >/dev/null 2>&1; then
-        /bin/launchctl bootout "gui/$uid/dev.agoc.tray"
-    fi
-fi
 if [[ -e "$autostart" || -L "$autostart" ]]; then
     rm -- "$autostart"
 fi
