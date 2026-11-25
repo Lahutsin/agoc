@@ -239,32 +239,36 @@ bash scripts/install-autostart.sh /absolute/path/to/release
 ```
 
 To remove login autostart, the passwordless grant, installed binaries, and
-AGOC's firewall rules:
+AGOC's firewall rules, as the same desktop account, run:
 
-1. Choose **Quit (remove protection)** in the tray first.
-2. As the same desktop account, run:
+```sh
+bash scripts/uninstall-autostart.sh
+```
 
-   ```sh
-   bash scripts/uninstall-autostart.sh
-   ```
+On Linux, choose **Quit (remove protection)** in the tray first: the
+uninstaller refuses to remove a running guardian. On macOS, the uninstaller
+unloads the login LaunchAgent and stops the tray itself, then waits for the
+monitor and its guardian to exit before removing the rules. Both refuse to
+remove another account's installation. It does not remove the baseline file,
+disable PF, or edit the main PF configuration.
 
-The uninstaller requests administrator authorization and refuses to remove a
-running guardian or another account's installation. It does not remove the
-baseline file, disable PF, or edit the main PF configuration.
-
-To update an existing Linux installation without changing its autostart entry
-or sudoers permission, run the updater as the desktop user:
+To update an existing installation (Linux or macOS) without changing its
+autostart entry or sudoers permission, run the updater as the desktop user:
 
 ```sh
 bash scripts/update-installation.sh
 ```
 
-It builds both release binaries, gracefully stops the installed tray, removes
-AGOC's firewall rules, replaces the root-owned binaries, and starts the tray
-again. Protection is temporarily removed during the update. If a guardian
-cannot be stopped cleanly, the updater refuses to replace binaries. The updater
-currently supports Linux only. These scripts are opt-in; building the project
-does not modify system startup or sudoers.
+It builds both release binaries, stops the installed tray, waits for the
+privileged monitor and its guardian to exit, removes AGOC's firewall rules,
+replaces the root-owned binaries, and starts the tray again: on macOS through
+the login LaunchAgent (`launchctl kickstart`, or `launchctl bootstrap` when it
+was unloaded, falling back to a background start), on Linux as a background
+process writing startup output to `~/.local/state/agoc/update.log` (the macOS
+fallback writes to `~/Library/Logs/agoc/update.log`). Protection is temporarily
+removed during the update. If the tray, monitor or guardian cannot be stopped
+cleanly, the updater refuses to replace binaries. These scripts are opt-in;
+building the project does not modify system startup or sudoers.
 
 ## Run from the terminal instead
 
