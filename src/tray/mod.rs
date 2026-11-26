@@ -102,23 +102,23 @@ impl View {
                 let allow6 = allow6 && network.ipv6.changed();
                 self.label = if allow4 || allow6 {
                     let family = match (allow4, allow6) { (true, true) => "IPv4 + IPv6", (true, false) => "IPv4", _ => "IPv6" };
-                    format!("IP changed - OK to use ({family}, {addresses} IPs)")
+                    format!("AI OPEN ({family}, {addresses} IPs)")
                 } else if network.error.is_some() {
                     if network.ipv4.original.is_none() && network.ipv6.original.is_none() {
-                        "Original IP unknown - BLOCKED".into()
+                        "Original IP unknown - AI CLOSE".into()
                     } else {
-                        "Network check failed - BLOCKED".into()
+                        "Network check failed - AI CLOSE".into()
                     }
                 } else if [&network.ipv4, &network.ipv6].iter().any(|family| {
                     matches!((family.original, family.current), (Some(a), Some(b)) if a == b)
                 }) {
-                    "IP unchanged - BLOCKED".into()
+                    "IP unchanged - AI CLOSE".into()
                 } else if network.ipv4.original.is_none() || network.ipv6.original.is_none() {
-                    "Original IP unknown - BLOCKED".into()
+                    "Original IP unknown - AI CLOSE".into()
                 } else if network.ipv4.current.is_none() || network.ipv6.current.is_none() {
-                    "Current IP unknown - BLOCKED".into()
+                    "Current IP unknown - AI CLOSE".into()
                 } else {
-                    "IP unchanged - BLOCKED".into()
+                    "IP unchanged - AI CLOSE".into()
                 };
                 self.details = [
                     family_row(&network.ipv4, "IPv4", allow4),
@@ -923,7 +923,7 @@ mod tests {
                 )
                 .unwrap());
             assert_eq!(view.color, color);
-            assert_eq!(view.label.contains("OK to use"), v4 || v6);
+            assert_eq!(view.label.contains("AI OPEN"), v4 || v6);
             assert!(view.details[0].starts_with("IPv4 "));
             assert!(view.details[0].contains("8.8.8.8"));
             assert!(view.details[1].contains(if v6 {
@@ -1038,7 +1038,7 @@ mod tests {
             &worker,
         )
         .unwrap();
-        assert_eq!(view.label, "IP changed - OK to use (IPv4, 123456 IPs)");
+        assert_eq!(view.label, "AI OPEN (IPv4, 123456 IPs)");
         assert_eq!(
             view.details[0],
             "IPv4 ALLOWED: 203.0.113.10 → 198.51.100.200"
@@ -1101,7 +1101,7 @@ mod tests {
         let mut view = View::default();
         view.event(status(true, no_ipv6.clone()), &worker).unwrap();
         assert_eq!(view.color, Color::Allowed);
-        assert!(view.label.contains("OK to use"));
+        assert!(view.label.contains("AI OPEN"));
         assert!(view.details[1].contains("BLOCKED"));
 
         // IPv6 reachable but unchanged -> still amber.
@@ -1136,8 +1136,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(view.color, Color::Blocked);
-        assert_eq!(view.label, "Original IP unknown - BLOCKED");
-        assert!(!view.label.contains("OK to use"));
+        assert_eq!(view.label, "Original IP unknown - AI CLOSE");
+        assert!(!view.label.contains("AI OPEN"));
     }
 
     #[test]
