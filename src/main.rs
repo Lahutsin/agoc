@@ -1,10 +1,9 @@
 mod firewall;
 
 use agoc::control::{Control, Message};
-use agoc::{
-    executable,
-    network::{self, FamilyStatus, NetworkOptions, NetworkStatus},
-};
+#[cfg(unix)]
+use agoc::executable;
+use agoc::network::{self, FamilyStatus, NetworkOptions, NetworkStatus};
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::{
@@ -122,6 +121,9 @@ enum Action {
         domain: Vec<String>,
         #[arg(long, hide = true)]
         control: Option<PathBuf>,
+        /// Windows: authenticates this monitor to the tray's loopback endpoint.
+        #[arg(long, hide = true, requires = "control")]
+        control_token: Option<String>,
     },
     /// Explicitly remove protection (root). Stop the monitor first.
     Uninstall {
@@ -247,8 +249,10 @@ fn domain(value: &str) -> std::result::Result<String, String> {
 }
 
 fn require_root() -> Result<()> {
-    let output = Command::new("/usr/bin/id").arg("-u").output()?;
-    if !output.status.success() || output.stdout != b"0\n" {
+    if !agoc::is_privileged()? {
+        #[cfg(windows)]
+        bail!("This operation requires administrator rights; run it from an elevated terminal");
+        #[cfg(not(windows))]
         bail!("This operation requires root; run with sudo");
     }
     Ok(())
@@ -327,6 +331,13 @@ fn record_baseline(path: &Path, ipv6: bool) -> Result<()> {
 }
 
 fn read_baseline(path: &Path) -> Result<Baseline> {
+    #[cfg(windows)]
+    {
+        if !fs::symlink_metadata(path)?.is_file() || !agoc::windows::owned_by_administrators(path)?
+        {
+            bail!("Baseline must be a regular file owned by Administrators (create it from an elevated terminal)");
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -617,9 +628,20 @@ fn monitor(
     interval: u64,
     extra: Vec<String>,
     socket: Option<PathBuf>,
+    token: Option<String>,
 ) -> Result<()> {
     require_root()?;
-    let mut control = socket.as_deref().map(Control::connect).transpose()?;
+    // Started by the tray through UAC with a hidden console: keep a log in the
+    // administrator-only data directory instead.
+    #[cfg(windows)]
+    if socket.is_some() {
+        let log = agoc::windows::secure_data_directory()?.join("agoc.log");
+        agoc::windows::redirect_stderr(&log)?;
+    }
+    let mut control = socket
+        .as_deref()
+        .map(|socket| Control::connect(socket, token.as_deref()))
+        .transpose()?;
     let result = monitor_inner(options, interval, extra, control.as_mut());
     if let (Err(error), Some(control)) = (&result, &mut control) {
         if let Err(send_error) = control.send(&Message::Failure {
@@ -664,7 +686,8 @@ fn main() {
             interval,
             domain,
             control,
-        } => monitor(network, interval, domain, control),
+            control_token,
+        } => monitor(network, interval, domain, control, control_token),
         Action::Uninstall { if_present } => require_root().and_then(|_| {
             let _lock = firewall::lock()?;
             if if_present {
@@ -681,6 +704,12 @@ fn main() {
     }
 }
 
+#[cfg(windows)]
+fn desktop_helper(_control: PathBuf) -> Result<()> {
+    bail!("The passwordless desktop helper is not available on Windows; the tray asks for UAC consent")
+}
+
+#[cfg(unix)]
 fn desktop_helper(control: PathBuf) -> Result<()> {
     require_root()?;
     let uid: u32 = std::env::var("SUDO_UID")
@@ -691,9 +720,16 @@ fn desktop_helper(control: PathBuf) -> Result<()> {
         bail!("Desktop helper requires a non-root invoking user");
     }
     validate_desktop_socket(&control, uid)?;
-    monitor(NetworkOptions::default(), 2, Vec::new(), Some(control))
+    monitor(
+        NetworkOptions::default(),
+        2,
+        Vec::new(),
+        Some(control),
+        None,
+    )
 }
 
+#[cfg(unix)]
 fn validate_desktop_socket(path: &Path, uid: u32) -> Result<()> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt};
     if !path.is_absolute() || path.file_name() != Some(std::ffi::OsStr::new("control.sock")) {
@@ -798,6 +834,22 @@ mod tests {
         assert!(Cli::try_parse_from(["agoc", "desktop-helper", "uninstall"]).is_err());
     }
 
+    #[test]
+    fn control_token_requires_a_control_endpoint() {
+        let token = "ab".repeat(32);
+        assert!(Cli::try_parse_from(["agoc", "run", "--control-token", &token]).is_err());
+        assert!(Cli::try_parse_from([
+            "agoc",
+            "run",
+            "--control",
+            "127.0.0.1:50000",
+            "--control-token",
+            &token
+        ])
+        .is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn restricted_helper_validates_socket_ownership_permissions_and_symlinks() {
         use std::os::unix::{

@@ -3,8 +3,8 @@
 **AGOC** - anti-ban for **A**nthropic, **G**oogle, **O**penAI and **C**opilot
 (formerly *Antiban*).
 
-A Rust IP gate for Linux and macOS, with a command-line monitor and a system tray
-app. Known destination IPs of AI services (Claude/Anthropic, OpenAI/ChatGPT,
+A Rust IP gate for Linux, macOS and Windows, with a command-line monitor and a
+system tray app. Known destination IPs of AI services (Claude/Anthropic, OpenAI/ChatGPT,
 GitHub Copilot, Microsoft Copilot) are allowed only when the public address
 differs from the original address measured directly through the physical
 network interface. A VPN is optional: any public-IP change counts.
@@ -43,6 +43,9 @@ This produces two binaries:
 
 Keep both binaries in the same directory. Build on each OS separately; a Linux
 binary does not run on macOS. For a CLI-only build, omit `--features tray`.
+On Windows the binaries are `agoc.exe` and `agoc-tray.exe`; build them with the
+MSVC toolchain (`x86_64-pc-windows-msvc`, Visual Studio Build Tools) from a
+normal PowerShell or Command Prompt, using the same `cargo build` command.
 
 ### Linux requirements
 
@@ -61,6 +64,15 @@ binary does not run on macOS. For a CLI-only build, omit `--features tray`.
   plus administrator access. HTTPS uses the native system TLS implementation.
 - `anchor "agoc"` configured in `/etc/pf.conf`; see [macOS PF setup](#macos-pf-setup).
 
+### Windows requirements
+
+- Windows 10 or 11 (x64) and an administrator account; the firewall helper is
+  started through the UAC consent prompt.
+- Windows Defender Firewall **turned on for all profiles** (Domain, Private,
+  Public), with local firewall rules allowed by Group Policy; see
+  [Windows Firewall](#windows-firewall). The built-in `netsh.exe` and Windows
+  PowerShell 5.1 are used. HTTPS uses the native Windows TLS (Schannel).
+
 ## Automatic original-IP detection
 
 No saved baseline or VPN-off setup is required in the default mode.
@@ -76,11 +88,17 @@ a failed direct exit, or an unchanged address never authorizes that family.
 There is no automatic fallback to a saved baseline or an unbound socket.
 
 Linux uses `SO_BINDTODEVICE`; macOS uses `IP_BOUND_IF`/`IPV6_BOUND_IF`.
+Windows binds the probe socket to the physical adapter's own IPv4/IPv6 address;
+with the default strong-host send model Windows sends such packets only through
+the adapter that owns the address. A missing address fails the probe; it never
+falls back to the default route.
 AGOC does not change global routes or disable your VPN. These direct probes
 are intentional traffic outside the VPN, including while the VPN is enabled.
 
 The physical interface is selected from active hardware interfaces with default
-routes (Linux prefers the lowest route metric; macOS prefers an unscoped route).
+routes (Linux prefers the lowest route metric; macOS prefers an unscoped route;
+Windows prefers the lowest route + interface metric among hardware Ethernet/Wi-Fi
+adapters, IPv4 first).
 Ambiguous routes are blocked until you select the interface explicitly:
 
 ```sh
@@ -90,8 +108,14 @@ Ambiguous routes are blocked until you select the interface explicitly:
 ./target/release/agoc-tray --direct-interface en0
 ```
 
+```powershell
+# Windows example (adapter name as shown by Get-NetAdapter):
+.\target\release\agoc-tray.exe --direct-interface "Wi-Fi"
+```
+
 Hardware-backed Ethernet/Wi-Fi interfaces are supported; tunnel, loopback,
-bridge, and other purely virtual interfaces are not accepted as direct exits.
+bridge, and other purely virtual interfaces (on Windows also TAP/Wintun VPN
+adapters and Hyper-V/WSL virtual switches) are not accepted as direct exits.
 
 ### Can I start the app with my VPN already enabled?
 
@@ -108,13 +132,27 @@ Start this as your **normal desktop user, without sudo**:
 ./target/release/agoc-tray
 ```
 
+On Windows, start `target\release\agoc-tray.exe` (double-click or from a normal,
+non-elevated terminal).
+
 Authorize the firewall helper when prompted:
 
 - Linux uses the desktop polkit authentication dialog.
 - macOS uses the native administrator authorization dialog.
+- Windows uses the UAC consent prompt. If no prompt appears, click the flashing
+  shield in the taskbar. Cancelling it shows an error in the tray menu.
 
-The tray itself does not run as root. It communicates with the helper through
-a Unix socket in a private, permission-restricted temporary directory.
+The tray itself does not run as root/elevated. On Linux and macOS it
+communicates with the helper through a Unix socket in a private,
+permission-restricted temporary directory. On Windows it uses a loopback TCP
+port; the helper must first present a random 256-bit token that the tray passes
+on the helper's command line, so other local processes cannot impersonate it.
+
+On Windows the tray has no console window: its messages go to
+`%LOCALAPPDATA%\agoc\agoc-tray.log`, and the elevated helper (whose console is
+hidden) writes to `%ProgramData%\agoc\agoc.log`. That directory is created with
+an administrator-only ACL; if it already exists with another owner, the helper
+refuses to start until it is removed.
 
 ### Tray indicator and menu
 
@@ -128,8 +166,9 @@ runtime and nothing is resampled:
   the one matching its panel size and HiDPI scale.
 - **macOS:** the 36 px image is used, because the menu bar draws status icons
   18 pt high (pixel-exact on Retina, clean 2:1 on non-Retina displays).
-- **Windows** is not supported by the app; 16/20/24/32/40/48 px are generated
-  for a future port (100-300 % scaling).
+- **Windows:** the 16/20/24/32/40/48 px image matching the primary display's
+  scaling (100-300 %) is used, as the notification area draws small icons
+  16 px high at 100 %.
 
 `icon/icon.png` is the same artwork at 1024 px (with a green globe). To change
 the icon, edit and run `python3 icon/gen_icon.py` (Pillow), then rebuild.
@@ -174,7 +213,8 @@ rules may remain. Stop remaining monitors and use the manual uninstall command
 below. An unexpected tray crash/disconnection is not treated as an authorized
 request to remove the firewall rules.
 
-An optional login installer is provided below. There is no macOS `.app` bundle.
+An optional login installer is provided below. There is no macOS `.app` bundle
+and no Windows MSI installer.
 
 ## Start automatically at desktop login (Linux and macOS)
 
@@ -270,6 +310,51 @@ removed during the update. If the tray, monitor or guardian cannot be stopped
 cleanly, the updater refuses to replace binaries. These scripts are opt-in;
 building the project does not modify system startup or sudoers.
 
+## Start automatically at login (Windows)
+
+Build on Windows, then run the installer as your normal user from the
+repository (Windows PowerShell 5.1 or PowerShell 7):
+
+```powershell
+cargo build --release --features tray
+powershell -ExecutionPolicy Bypass -File scripts\install-windows.ps1
+```
+
+It asks for UAC consent once to copy `agoc.exe` and `agoc-tray.exe` into
+`%ProgramFiles%\AGOC` (inheriting the Program Files permissions: only
+administrators can replace them) and adds the per-user login entry
+`HKCU\Software\Microsoft\Windows\CurrentVersion\Run\AGOC`. At every login
+the tray starts as your user and shows the UAC prompt for the firewall helper.
+Unlike Linux/macOS, **no passwordless elevation is installed**: there is no
+sudoers-like grant, so `--installed-helper` is not available on Windows.
+
+To update an existing installation without changing its login entry, run the
+updater as your normal user:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\update-windows.ps1
+```
+
+It builds both release binaries (`cargo build --locked --release --features
+tray`), stops the installed tray, waits up to 90 seconds for the elevated
+monitor and its guardian to exit, removes AGOC's firewall rules, replaces the
+binaries in `%ProgramFiles%\AGOC` (restoring the old ones if that fails) and
+starts the tray again, which asks for UAC consent. Protection is temporarily
+removed during the update. The replacement step asks for UAC consent once. If
+the tray, monitor or guardian cannot be stopped cleanly, no binaries are
+replaced. Alternatively, choose **Quit (remove protection)**, rebuild and run
+the installer again; it also replaces the binaries of an existing installation.
+
+To remove the login entry, the binaries and AGOC's firewall rules:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\uninstall-windows.ps1
+```
+
+The installer and uninstaller refuse to run while `agoc.exe` or
+`agoc-tray.exe` is running.
+`%ProgramData%\agoc` (log and lock file) and baseline files are kept.
+
 ## Run from the terminal instead
 
 ```sh
@@ -298,8 +383,12 @@ exit, and run:
 sudo ./target/release/agoc uninstall
 ```
 
+On Windows, run the same commands without `sudo` from an elevated terminal
+(**Run as administrator**), for example `.\target\release\agoc.exe run`.
+
 Concurrent guardians and uninstall are prevented by a file lock at
-`/var/run/agoc.lock`. Do not manually delete this lock file.
+`/var/run/agoc.lock` (Windows: `%ProgramData%\agoc\agoc.lock`). Do not manually
+delete this lock file.
 
 ## Optional saved-baseline mode
 
@@ -324,7 +413,9 @@ sudo ./target/release/agoc run --state /etc/agoc-baseline.txt
 ```
 
 The file is never overwritten automatically. It must remain a root-owned
-regular file not writable by other users. Without `baseline --ipv6`, protected
+regular file not writable by other users. On Windows it must be owned by
+Administrators: create it from an elevated terminal, preferably in a directory
+standard users cannot write to (for example `%ProgramData%\agoc`). Without `baseline --ipv6`, protected
 IPv6 stays blocked in saved-baseline mode. Never capture a manual baseline
 while the VPN is enabled. Failed automatic checks never fall back to this mode.
 
@@ -362,6 +453,33 @@ On Linux, AGOC owns only `table inet agoc`, uses transactional updates,
 and filters local outgoing packets, including established connections.
 Traffic of containers/VMs forwarded by this host passes the same filter
 (forward hook).
+
+## Windows Firewall
+
+AGOC does not need manual firewall configuration on Windows, but Windows
+Defender Firewall must be **on for all three profiles** and must honor local
+rules. On start, the helper checks the effective policy
+(`Get-NetFirewallProfile -PolicyStore ActiveStore`) and refuses to run, showing
+an error, when a profile is off or Group Policy ignores local rules
+(`AllowLocalFirewallRules = False`). A third-party firewall that replaces
+Windows Defender Firewall is not supported.
+
+Blocked families are enforced by outbound block rules named `AGOC-IPv4-A`,
+`AGOC-IPv4-B`, `AGOC-IPv6-A` and `AGOC-IPv6-B` (at most 100 addresses per rule;
+one name may hold several rules). Block rules take precedence over allow rules.
+A changed address set is added under the unused name before the old name is
+removed, so updates do not open a gap. Allowing a family deletes its rules.
+Tray Quit and `agoc uninstall` delete all four names. List them with:
+
+```powershell
+netsh advfirewall firewall show rule name=AGOC-IPv4-A
+```
+
+Unlike nftables and PF rules, **Windows Firewall rules persist across
+reboots**: if the computer shuts down while AGOC blocks, the AI services stay
+blocked after the reboot until AGOC starts again (it then re-evaluates) or
+`agoc.exe uninstall` runs from an elevated terminal. The names `AGOC-IPv*-A/B`
+are reserved for this app.
 
 ## Limitations
 
@@ -401,6 +519,15 @@ Traffic of containers/VMs forwarded by this host passes the same filter
   destination discovery can bypass protection. Known addresses accumulate only
   during the current monitoring session. This is not a persistent boot policy.
 - The names `inet agoc` and PF anchor `agoc` are reserved for this app.
+- **Windows:** blocking applies to new connections. Whether Windows Firewall
+  re-evaluates already established connections when a block rule is added has
+  not been verified; restart the AI application (or reconnect) after AGOC
+  switches to BLOCKED. There is no kernel-side permission expiry (only the
+  guardian's 30-second heartbeat timeout), as on macOS. Traffic of WSL 2 and
+  Hyper-V virtual machines behind NAT is not covered by the host's outbound
+  rules. Adapter selection and source-address binding assume the default
+  strong-host send model; a VPN client that enforces its own kill switch makes
+  the original IP unknown, which keeps access blocked.
 
 A strict no-leak guarantee requires an isolated application network with a
 single verified exit, not periodically comparing public IP addresses.
@@ -440,5 +567,20 @@ AGOC_TEST_HOST_MNTNS="$(readlink /proc/self/ns/mnt)" \
   cargo test --features tray --test tray_shutdown -- --ignored
 ```
 
-Real external-network switching and PF still require dedicated Linux/macOS
-test machines. Do not modify a shared machine's firewall just to run tests.
+The Windows and macOS code can be type-checked and linted from Linux (no
+linker or SDK needed); unit tests for the platform-independent parts of the
+Windows backend (adapter/route selection, rule generation, firewall profile
+parsing, command-line quoting, icon sizes) run on every platform:
+
+```sh
+rustup target add x86_64-pc-windows-msvc aarch64-apple-darwin
+cargo clippy --target x86_64-pc-windows-msvc --features tray --all-targets -- -D warnings
+cargo clippy --target aarch64-apple-darwin --features tray --all-targets -- -D warnings
+```
+
+On Windows, run `cargo test --features tray` natively. PowerShell scripts can
+be checked with `Invoke-ScriptAnalyzer scripts\*.ps1` (PSScriptAnalyzer).
+
+Real external-network switching, PF and Windows Firewall still require
+dedicated Linux/macOS/Windows test machines. Do not modify a shared machine's
+firewall just to run tests.

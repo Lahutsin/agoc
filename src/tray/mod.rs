@@ -1,25 +1,31 @@
+/// tao + tray-icon event loop (macOS menu bar, Windows notification area).
+#[cfg(any(target_os = "macos", windows))]
+mod desktop;
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "macos")]
-mod macos;
 
 use crate::control::{self, Message};
 use crate::network::NetworkOptions;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+#[cfg(unix)]
+use std::fs::File;
 use std::{
-    fs::{File, OpenOptions},
+    fs::OpenOptions,
     io::{BufRead, BufReader},
+    path::Path,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread,
+    time::{Duration, Instant},
+};
+#[cfg(unix)]
+use std::{
     os::unix::{
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         io::AsRawFd,
         net::UnixListener,
     },
-    path::Path,
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
-    thread,
-    time::{Duration, Instant},
 };
 
 #[derive(Parser, Debug)]
@@ -45,7 +51,7 @@ enum Event {
     Finished,
     Failed(String),
     Quit,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     Refresh,
 }
 
@@ -226,7 +232,7 @@ fn family_row(family: &crate::network::FamilyStatus, name: &str, allowed: bool) 
 /// the frame (rounded square, without the globe) and the globe coverage mask.
 /// Each size is used as-is: resampling one big image at runtime is what made small
 /// tray icons blurry. Linux hosts pick the closest size for their panel and scale;
-/// macOS uses `macos::ICON_SIZE`.
+/// macOS uses 36 px and Windows the size matching the display scale.
 const ARTWORK: &[(u32, &[u8], &[u8])] = &[
     (
         16,
@@ -320,6 +326,18 @@ fn artwork() -> Result<Vec<Artwork>> {
         .collect()
 }
 
+/// The Windows notification area shows small icons (16 px at 100 % scaling,
+/// 20 px at 125 %, ...): the smallest pre-rendered size covering 16 px at `scale`.
+#[cfg(any(windows, test))]
+fn windows_icon_size(scale: f64) -> u32 {
+    const SIZES: [u32; 6] = [16, 20, 24, 32, 40, 48];
+    let wanted = (16.0 * scale.clamp(1.0, 3.0)).round() as u32;
+    SIZES
+        .into_iter()
+        .find(|&size| size >= wanted)
+        .unwrap_or(SIZES[SIZES.len() - 1])
+}
+
 /// Status color of the globe: green when everything works, red when blocked,
 /// gray while starting or when the app itself failed.
 fn status_rgb(color: Color) -> [u8; 3] {
@@ -353,6 +371,37 @@ fn pixels(art: &Artwork, color: Color) -> Vec<u8> {
     rgba
 }
 
+#[cfg(windows)]
+pub fn run(options: Options) -> Result<()> {
+    let directory = crate::windows::user_data_directory()?;
+    // Release builds have no console window: keep diagnostics in a log file.
+    if !crate::windows::has_stderr() {
+        crate::windows::redirect_stderr(&directory.join("agoc-tray.log"))?;
+    }
+    if options.installed_helper {
+        bail!("--installed-helper is not available on Windows; the tray asks for UAC consent");
+    }
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join("agoc-tray.lock"))
+        .context("Cannot open tray instance lock")?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            eprintln!("AGOC tray is already running; ignoring duplicate launch");
+            return Ok(());
+        }
+        Err(std::fs::TryLockError::Error(error)) => {
+            return Err(error).context("Cannot acquire tray instance lock")
+        }
+    }
+    desktop::run(options)
+}
+
+#[cfg(unix)]
 pub fn run(options: Options) -> Result<()> {
     let uid = Command::new("/usr/bin/id").arg("-u").output()?;
     if !uid.status.success() || uid.stdout == b"0\n" {
@@ -370,13 +419,15 @@ pub fn run(options: Options) -> Result<()> {
     #[cfg(target_os = "linux")]
     return linux::run(options);
     #[cfg(target_os = "macos")]
-    return macos::run(options);
+    return desktop::run(options);
 }
 
+#[cfg(unix)]
 struct InstanceLock {
     _file: File,
 }
 
+#[cfg(unix)]
 impl InstanceLock {
     fn acquire(uid: u32) -> Result<Option<Self>> {
         let path = std::env::temp_dir().join(format!("agoc-tray-{uid}.lock"));
@@ -435,21 +486,19 @@ impl Worker {
     }
 }
 
-fn monitor_arguments(options: &Options, socket: &Path) -> Vec<String> {
+/// Monitor command line; `control` holds the control-endpoint arguments.
+fn monitor_arguments(options: &Options, control: &[String]) -> Vec<String> {
     if options.installed_helper {
-        return vec![
-            "desktop-helper".into(),
-            "--control".into(),
-            socket.to_string_lossy().into_owned(),
-        ];
+        return std::iter::once("desktop-helper".to_string())
+            .chain(control.iter().cloned())
+            .collect();
     }
     let mut arguments = vec![
         "run".into(),
         "--interval".into(),
         options.interval.to_string(),
-        "--control".into(),
-        socket.to_string_lossy().into_owned(),
     ];
+    arguments.extend(control.iter().cloned());
     if let Some(state) = &options.network.state {
         arguments.extend(["--state".into(), state.to_string_lossy().into_owned()]);
     }
@@ -467,6 +516,43 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Quotes one argument for the Windows command line (`CommandLineToArgvW`
+/// rules), so a path or domain can never split into extra arguments.
+#[cfg(any(windows, test))]
+fn windows_quote(argument: &str) -> String {
+    if !argument.is_empty() && !argument.contains([' ', '\t', '\n', '\u{b}', '"']) {
+        return argument.into();
+    }
+    let mut quoted = String::from('"');
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        if character == '\\' {
+            backslashes += 1;
+        } else {
+            if character == '"' {
+                // Escape the preceding backslashes and the quote itself.
+                quoted.extend(std::iter::repeat_n('\\', backslashes + 1));
+            }
+            backslashes = 0;
+        }
+        quoted.push(character);
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes));
+    quoted.push('"');
+    quoted
+}
+
+/// Removes the `\\?\` prefix that `canonicalize` adds on Windows; the shell
+/// does not accept it in `ShellExecuteEx`.
+#[cfg(windows)]
+fn plain_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    match path.to_str().and_then(|text| text.strip_prefix(r"\\?\")) {
+        Some(rest) if !rest.starts_with("UNC\\") => rest.into(),
+        _ => path,
+    }
+}
+
+#[cfg(unix)]
 fn elevation(program: &Path, arguments: &[String], installed: bool) -> Result<Command> {
     if installed {
         let mut command = Command::new("/usr/bin/sudo");
@@ -502,68 +588,216 @@ fn elevation(program: &Path, arguments: &[String], installed: bool) -> Result<Co
     }
 }
 
-fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Result<()> {
+/// The privileged monitor process, started through the platform's
+/// administrator authorization.
+struct Helper {
+    #[cfg(unix)]
+    child: std::process::Child,
+    #[cfg(windows)]
+    process: crate::windows::ElevatedProcess,
+}
+
+impl Helper {
+    #[cfg(unix)]
+    fn start(program: &Path, arguments: &[String], installed: bool) -> Result<Self> {
+        let child = elevation(program, arguments, installed)?
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("Cannot start administrator authorization")?;
+        Ok(Self { child })
+    }
+
+    /// Shows the UAC prompt and blocks until it is answered. The helper's
+    /// console is hidden; it logs to `%ProgramData%\agoc\agoc.log`.
+    #[cfg(windows)]
+    fn start(program: &Path, arguments: &[String], _installed: bool) -> Result<Self> {
+        let parameters = arguments
+            .iter()
+            .map(|argument| windows_quote(argument))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(Self {
+            process: crate::windows::ElevatedProcess::start(program, &parameters)?,
+        })
+    }
+
+    /// `Some((success, description))` once the helper has exited.
+    fn try_wait(&mut self) -> Result<Option<(bool, String)>> {
+        #[cfg(unix)]
+        return Ok(self
+            .child
+            .try_wait()?
+            .map(|status| (status.success(), status.to_string())));
+        #[cfg(windows)]
+        return Ok(self
+            .process
+            .try_wait()?
+            .map(|code| (code == 0, format!("exit code {code}"))));
+    }
+
+    fn cancel(&mut self) -> Result<()> {
+        #[cfg(unix)]
+        {
+            self.child
+                .kill()
+                .context("Cannot cancel administrator authorization")?;
+            self.child.wait()?;
+        }
+        #[cfg(windows)]
+        self.process.terminate();
+        Ok(())
+    }
+}
+
+/// Where the monitor connects back to the tray: a Unix socket in a private
+/// 0700 directory, or on Windows a loopback port plus a random token that the
+/// helper must present before anything else is exchanged.
+struct ControlListener {
+    #[cfg(unix)]
+    _directory: tempfile::TempDir,
+    #[cfg(unix)]
+    path: std::path::PathBuf,
+    #[cfg(unix)]
+    listener: UnixListener,
+    #[cfg(windows)]
+    listener: std::net::TcpListener,
+    #[cfg(windows)]
+    token: String,
+}
+
+impl ControlListener {
+    #[cfg(unix)]
+    fn bind() -> Result<Self> {
+        let temporary_root = std::env::temp_dir()
+            .canonicalize()
+            .context("Cannot resolve temporary directory")?;
+        let directory = tempfile::Builder::new()
+            .prefix("agoc-tray-")
+            .tempdir_in(temporary_root)?;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+        let path = directory.path().join("control.sock");
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            _directory: directory,
+            path,
+            listener,
+        })
+    }
+
+    #[cfg(windows)]
+    fn bind() -> Result<Self> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        listener.set_nonblocking(true)?;
+        Ok(Self {
+            listener,
+            token: crate::windows::random_token()?,
+        })
+    }
+
+    fn arguments(&self) -> Result<Vec<String>> {
+        #[cfg(unix)]
+        return Ok(vec![
+            "--control".into(),
+            self.path.to_string_lossy().into_owned(),
+        ]);
+        #[cfg(windows)]
+        return Ok(vec![
+            "--control".into(),
+            self.listener.local_addr()?.to_string(),
+            "--control-token".into(),
+            self.token.clone(),
+        ]);
+    }
+
+    /// The authenticated monitor connection, if one is waiting.
+    fn accept(&self) -> Result<Option<control::Stream>> {
+        let stream = match self.listener.accept() {
+            Ok((stream, _)) => stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        // On macOS/BSD and Windows, accepted sockets inherit non-blocking mode.
+        stream.set_nonblocking(false)?;
+        #[cfg(windows)]
+        {
+            use std::io::Read;
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+            // Read byte by byte: nothing after the token line may be buffered away.
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while line.len() <= control::TOKEN_LENGTH {
+                match (&stream).read(&mut byte) {
+                    Ok(1) if byte[0] == b'\n' => break,
+                    Ok(1) => line.push(byte[0]),
+                    _ => {
+                        line.clear();
+                        break;
+                    }
+                }
+            }
+            let received = String::from_utf8_lossy(&line);
+            if !control::token_matches(&self.token, &received) {
+                eprintln!("Rejected a control connection without the expected token");
+                return Ok(None);
+            }
+            stream.set_read_timeout(None)?;
+        }
+        Ok(Some(stream))
+    }
+}
+
+fn helper_program() -> Result<std::path::PathBuf> {
     let program = std::env::current_exe()?
         .parent()
         .context("Cannot locate executable directory")?
-        .join("agoc")
+        .join(format!("agoc{}", std::env::consts::EXE_SUFFIX))
         .canonicalize()
         .context("Keep agoc and agoc-tray in the same directory")?;
+    #[cfg(windows)]
+    let program = plain_path(program);
+    Ok(program)
+}
+
+fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Result<()> {
+    let program = helper_program()?;
     let mut options = options;
     if let Some(state) = &options.network.state {
-        options.network.state = Some(
-            state
-                .canonicalize()
-                .context("Saved-baseline mode requires an existing baseline file")?,
-        );
+        let state = state
+            .canonicalize()
+            .context("Saved-baseline mode requires an existing baseline file")?;
+        #[cfg(windows)]
+        let state = plain_path(state);
+        options.network.state = Some(state);
     }
-    let temporary_root = std::env::temp_dir()
-        .canonicalize()
-        .context("Cannot resolve temporary directory")?;
-    let directory = tempfile::Builder::new()
-        .prefix("agoc-tray-")
-        .tempdir_in(temporary_root)?;
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-    let path = directory.path().join("control.sock");
-    let listener = UnixListener::bind(&path)?;
-    listener.set_nonblocking(true)?;
-    let mut child = elevation(
+    let listener = ControlListener::bind()?;
+    let mut child = Helper::start(
         &program,
-        &monitor_arguments(&options, &path),
+        &monitor_arguments(&options, &listener.arguments()?),
         options.installed_helper,
-    )?
-    .stdin(Stdio::null())
-    .stdout(Stdio::null())
-    .stderr(Stdio::inherit())
-    .spawn()
-    .context("Cannot start administrator authorization")?;
+    )?;
     let started = Instant::now();
     let mut stream = loop {
-        match listener.accept() {
-            Ok((stream, _)) => break stream,
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
+        if let Some(stream) = listener.accept()? {
+            break stream;
         }
-        if let Some(status) = child.try_wait()? {
-            bail!("Administrator helper exited before connecting: {status}. Check authorization and terminal output");
+        if let Some((_, status)) = child.try_wait()? {
+            bail!("Administrator helper exited before connecting: {status}. Check authorization and its log output");
         }
         if commands.try_recv() != Err(TryRecvError::Empty) {
-            child
-                .kill()
-                .context("Cannot cancel administrator authorization")?;
-            child.wait()?;
+            child.cancel()?;
             notify(Event::Finished);
             return Ok(());
         }
         if started.elapsed() > Duration::from_secs(120) {
-            child.kill()?;
-            child.wait()?;
+            child.cancel()?;
             bail!("Administrator authorization timed out");
         }
         thread::sleep(Duration::from_millis(100));
     };
-    // On macOS/BSD, accepted sockets inherit O_NONBLOCK from a non-blocking listener.
-    stream.set_nonblocking(false)?;
+    drop(listener);
     let reader = stream.try_clone()?;
     let (messages, incoming) = mpsc::channel();
     thread::spawn(move || {
@@ -589,7 +823,7 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
                 message => notify(Event::Status(message)),
             }
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some((success, status)) = child.try_wait()? {
             // Drain the reader after process exit before checking the final acknowledgement.
             for message in incoming.iter() {
                 match message? {
@@ -597,7 +831,7 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
                     message => notify(Event::Status(message)),
                 }
             }
-            if stopped && status.success() {
+            if stopped && success {
                 notify(Event::Finished);
                 return Ok(());
             }
@@ -611,6 +845,7 @@ fn work(options: Options, commands: Receiver<()>, notify: &impl Fn(Event)) -> Re
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn only_one_tray_instance_can_hold_the_lock() {
         use std::os::unix::fs::MetadataExt;
@@ -627,6 +862,20 @@ mod tests {
     #[test]
     fn shell_arguments_cannot_become_commands() {
         assert_eq!(shell_quote("a'b; $HOME"), "'a'\\''b; $HOME'");
+    }
+
+    #[test]
+    fn windows_arguments_cannot_split_or_escape_quotes() {
+        assert_eq!(windows_quote("run"), "run");
+        assert_eq!(windows_quote(""), "\"\"");
+        assert_eq!(windows_quote("Wi-Fi 2"), "\"Wi-Fi 2\"");
+        assert_eq!(
+            windows_quote(r"C:\Program Files\AGOC\"),
+            r#""C:\Program Files\AGOC\\""#
+        );
+        assert_eq!(windows_quote(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(windows_quote(r#"a\"b c"#), r#""a\\\"b c""#);
+        assert_eq!(windows_quote(r"C:\dir\file.txt"), r"C:\dir\file.txt");
     }
 
     #[test]
@@ -691,6 +940,27 @@ mod tests {
                 pixels(&art, Color::Blocked).len(),
                 (art.size * art.size * 4) as usize
             );
+        }
+    }
+
+    #[test]
+    fn windows_icon_matches_display_scaling() {
+        for (scale, size) in [
+            (1.0, 16),
+            (1.25, 20),
+            (1.5, 24),
+            (1.75, 32),
+            (2.0, 32),
+            (2.5, 40),
+            (3.0, 48),
+            (4.0, 48),
+            (0.5, 16),
+        ] {
+            assert_eq!(windows_icon_size(scale), size, "{scale}");
+        }
+        let available: Vec<_> = artwork().unwrap().iter().map(|art| art.size).collect();
+        for size in [16, 20, 24, 32, 40, 48] {
+            assert!(available.contains(&size));
         }
     }
 
@@ -872,11 +1142,13 @@ mod tests {
 
     #[test]
     fn automatic_launch_needs_no_saved_baseline() {
+        let control = ["--control".to_string(), "/tmp/control.sock".to_string()];
         let options = Options::try_parse_from(["agoc-tray"]).unwrap();
-        let arguments = monitor_arguments(&options, Path::new("/tmp/control.sock"));
+        let arguments = monitor_arguments(&options, &control);
         assert!(!arguments.iter().any(|arg| arg == "--state"));
+        assert!(arguments.ends_with(&control));
         let options = Options::try_parse_from(["agoc-tray", "--direct-interface", "en0"]).unwrap();
-        assert!(monitor_arguments(&options, Path::new("/tmp/control.sock"))
+        assert!(monitor_arguments(&options, &control)
             .windows(2)
             .any(|args| args == ["--direct-interface", "en0"]));
         assert!(Options::try_parse_from([
@@ -889,11 +1161,13 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn installed_mode_uses_only_the_restricted_helper() {
+        let control = ["--control".to_string(), "/tmp/control.sock".to_string()];
         let options = Options::try_parse_from(["agoc-tray", "--installed-helper"]).unwrap();
         assert_eq!(
-            monitor_arguments(&options, Path::new("/tmp/control.sock")),
+            monitor_arguments(&options, &control),
             ["desktop-helper", "--control", "/tmp/control.sock"]
         );
         for flag in ["--state", "--direct-interface", "--interval", "--domain"] {
@@ -903,7 +1177,7 @@ mod tests {
         }
         let command = elevation(
             Path::new("/opt/agoc/agoc"),
-            &monitor_arguments(&options, Path::new("/tmp/control.sock")),
+            &monitor_arguments(&options, &control),
             true,
         )
         .unwrap();
@@ -911,6 +1185,7 @@ mod tests {
         assert_eq!(command.get_args().take(2).collect::<Vec<_>>(), ["-n", "--"]);
     }
 
+    #[cfg(unix)]
     #[test]
     fn accepted_control_stream_blocks_instead_of_returning_would_block() {
         let directory = tempfile::tempdir().unwrap();

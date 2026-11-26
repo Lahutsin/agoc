@@ -1,18 +1,21 @@
+#[cfg(unix)]
+use crate::executable;
+use crate::Policy;
 #[cfg(any(target_os = "linux", test))]
 use crate::LEASE_SECONDS;
-use crate::{executable, Policy};
 use anyhow::{bail, Context, Result};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", windows, test))]
 use std::collections::BTreeSet;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(any(target_os = "macos", windows, test))]
+use std::net::IpAddr;
+#[cfg(any(target_os = "macos", windows))]
+use std::sync::Mutex;
 use std::{
     fs::{File, OpenOptions},
-    io::Write,
     process::{Command, Stdio},
 };
-#[cfg(any(target_os = "macos", test))]
-use std::net::IpAddr;
-#[cfg(target_os = "macos")]
-use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 const PF_TOKEN_PATH: &str = "/var/run/agoc.pf-token";
@@ -27,12 +30,17 @@ pub(crate) fn lock() -> Result<File> {
     options.create(true).read(true).write(true).truncate(false);
     #[cfg(unix)]
     options.mode(0o600);
-    let file = options.open("/var/run/agoc.lock")?;
+    #[cfg(unix)]
+    let path = std::path::PathBuf::from("/var/run/agoc.lock");
+    #[cfg(windows)]
+    let path = agoc::windows::secure_data_directory()?.join("agoc.lock");
+    let file = options.open(path)?;
     file.try_lock()
         .context("Another agoc guardian/uninstall is running; stop it first")?;
     Ok(file)
 }
 
+#[cfg(unix)]
 fn execute_output(
     program: &std::path::Path,
     args: &[&str],
@@ -65,6 +73,7 @@ fn execute_output(
     ))
 }
 
+#[cfg(unix)]
 fn execute(program: &std::path::Path, args: &[&str], input: &str) -> Result<String> {
     Ok(execute_output(program, args, input)?.0)
 }
@@ -157,6 +166,14 @@ pub(crate) fn uninstall() -> Result<()> {
 }
 
 pub(crate) fn uninstall_if_present() -> Result<()> {
+    #[cfg(windows)]
+    {
+        let netsh = netsh()?;
+        if !WINDOWS_RULES.iter().any(|name| rule_exists(&netsh, name)) {
+            eprintln!("AGOC firewall rules are already absent");
+            return Ok(());
+        }
+    }
     #[cfg(target_os = "linux")]
     {
         let nft = executable(&["/usr/sbin/nft", "/sbin/nft"])?;
@@ -349,19 +366,257 @@ pub(crate) fn uninstall() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// Windows: block rules in Windows Defender Firewall, managed with netsh.
+//
+// Each family uses two alternating rule names ("generations"). A changed
+// address set is first added under the unused name and only then is the old
+// name deleted, so updates never open a gap. One name may hold several rules
+// (chunks); `netsh delete rule name=...` removes all of them. netsh output is
+// localized, so only exit codes are evaluated.
+
+/// Rule names, per family: [IPv4 A, IPv4 B, IPv6 A, IPv6 B].
+#[cfg(any(windows, test))]
+const WINDOWS_RULES: [&str; 4] = ["AGOC-IPv4-A", "AGOC-IPv4-B", "AGOC-IPv6-A", "AGOC-IPv6-B"];
+
+/// Addresses per firewall rule; keeps each netsh command line short.
+#[cfg(any(windows, test))]
+const ADDRESSES_PER_RULE: usize = 100;
+
+#[cfg(windows)]
+#[derive(Default, Clone)]
+struct WindowsFamily {
+    /// Index (0/1) of the rule name currently holding the block, if any.
+    generation: Option<usize>,
+    blocked: BTreeSet<IpAddr>,
+}
+
+#[cfg(windows)]
+static WINDOWS_STATE: Mutex<Option<[WindowsFamily; 2]>> = Mutex::new(None);
+
+/// `netsh add rule` argument lists blocking `addresses` under `name`.
+#[cfg(any(windows, test))]
+fn windows_rule_arguments(name: &str, addresses: &BTreeSet<IpAddr>) -> Vec<Vec<String>> {
+    let addresses: Vec<_> = addresses.iter().map(ToString::to_string).collect();
+    addresses
+        .chunks(ADDRESSES_PER_RULE)
+        .map(|chunk| {
+            [
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                &format!("name={name}"),
+                "dir=out",
+                "action=block",
+                "enable=yes",
+                "profile=any",
+                "protocol=any",
+                &format!("remoteip={}", chunk.join(",")),
+                "description=AGOC-managed",
+            ]
+            .map(String::from)
+            .to_vec()
+        })
+        .collect()
+}
+
+/// Problems in `Get-NetFirewallProfile` output ("<Name> <Enabled> <AllowLocalFirewallRules>"
+/// per line) that would make the AGOC rules ineffective.
+#[cfg(any(windows, test))]
+fn windows_profile_problems(output: &str) -> Result<Vec<String>> {
+    let mut problems = Vec::new();
+    let mut profiles = 0;
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        let [name, enabled, local] = fields[..] else {
+            bail!("Unexpected firewall profile output: {line}");
+        };
+        profiles += 1;
+        if !enabled.eq_ignore_ascii_case("True") {
+            problems.push(format!("the {name} profile is turned off"));
+        }
+        if local.eq_ignore_ascii_case("False") {
+            problems.push(format!(
+                "Group Policy ignores local firewall rules in the {name} profile"
+            ));
+        }
+    }
+    if profiles == 0 {
+        bail!("No Windows Firewall profiles found");
+    }
+    Ok(problems)
+}
+
+#[cfg(windows)]
+fn netsh() -> Result<std::path::PathBuf> {
+    let path = agoc::windows::system_directory()?.join("netsh.exe");
+    if !path.is_file() {
+        bail!("Required executable not found: {}", path.display());
+    }
+    Ok(path)
+}
+
+/// Runs a system tool with an environment that cannot redirect it to
+/// user-controlled files (the caller is elevated, the environment is not).
+#[cfg(windows)]
+fn windows_command(program: &std::path::Path) -> Result<Command> {
+    let windows = agoc::windows::windows_directory()?;
+    let system = agoc::windows::system_directory()?;
+    let mut command = Command::new(program);
+    command
+        .env("SystemRoot", &windows)
+        .env("windir", &windows)
+        .env("PATH", &system)
+        .env(
+            "PSModulePath",
+            system.join(r"WindowsPowerShell\v1.0\Modules"),
+        )
+        .env_remove("PSExecutionPolicyPreference")
+        .stdin(Stdio::null());
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn windows_run(program: &std::path::Path, args: &[String]) -> Result<String> {
+    let output = windows_command(program)?
+        .args(args)
+        .output()
+        .with_context(|| format!("Cannot start {}", program.display()))?;
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).trim().to_string();
+    if !output.status.success() {
+        bail!(
+            "{} {} failed ({}): {} {}",
+            program.display(),
+            args.iter().take(4).cloned().collect::<Vec<_>>().join(" "),
+            output.status,
+            text(&output.stdout),
+            text(&output.stderr)
+        );
+    }
+    Ok(text(&output.stdout))
+}
+
+#[cfg(windows)]
+fn rule_exists(netsh: &std::path::Path, name: &str) -> bool {
+    windows_command(netsh)
+        .and_then(|mut command| {
+            Ok(command
+                .args(["advfirewall", "firewall", "show", "rule"])
+                .arg(format!("name={name}"))
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()?)
+        })
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(windows)]
+fn delete_rule(netsh: &std::path::Path, name: &str) -> Result<()> {
+    if rule_exists(netsh, name) {
+        windows_run(
+            netsh,
+            &[
+                "advfirewall".into(),
+                "firewall".into(),
+                "delete".into(),
+                "rule".into(),
+                format!("name={name}"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 pub(crate) fn prepare() -> Result<()> {
-    bail!("Only Linux and macOS are supported")
+    *WINDOWS_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    netsh()?;
+    let powershell =
+        agoc::windows::system_directory()?.join(r"WindowsPowerShell\v1.0\powershell.exe");
+    let output = windows_run(
+        &powershell,
+        &[
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-NonInteractive".into(),
+            "-Command".into(),
+            "$ErrorActionPreference = 'Stop'; Get-NetFirewallProfile -PolicyStore ActiveStore | \
+             ForEach-Object { '{0} {1} {2}' -f $_.Name, $_.Enabled, $_.AllowLocalFirewallRules }"
+                .into(),
+        ],
+    )
+    .context("Cannot read the Windows Firewall state")?;
+    let problems = windows_profile_problems(&output)?;
+    if !problems.is_empty() {
+        bail!(
+            "Windows Defender Firewall would not enforce AGOC rules: {}. \
+             Turn the firewall on for all profiles (see README)",
+            problems.join("; ")
+        );
+    }
+    Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub(crate) fn apply(_: &Policy) -> Result<()> {
-    bail!("Only Linux and macOS are supported")
+#[cfg(windows)]
+pub(crate) fn apply(policy: &Policy) -> Result<()> {
+    let netsh = netsh()?;
+    let mut guard = WINDOWS_STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        // Start from a clean state: leftovers of an earlier session are unknown.
+        for name in WINDOWS_RULES {
+            delete_rule(&netsh, name)?;
+        }
+        *guard = Some(Default::default());
+    }
+    let families = guard.as_mut().context("Missing firewall state")?;
+    for (slot, ipv6, allowed) in [(0, false, policy.allow4), (1, true, policy.allow6)] {
+        let names = [WINDOWS_RULES[slot * 2], WINDOWS_RULES[slot * 2 + 1]];
+        let family = &mut families[slot];
+        let wanted: BTreeSet<IpAddr> = if allowed {
+            BTreeSet::new()
+        } else {
+            policy
+                .addresses
+                .iter()
+                .copied()
+                .filter(|ip| ip.is_ipv6() == ipv6)
+                .collect()
+        };
+        if family.generation.is_some() == !wanted.is_empty() && family.blocked == wanted {
+            continue;
+        }
+        if wanted.is_empty() {
+            // Both names: a failed earlier update may have left partial rules.
+            for name in names {
+                delete_rule(&netsh, name)?;
+            }
+            *family = WindowsFamily::default();
+            continue;
+        }
+        let next = family.generation.map_or(0, |current| 1 - current);
+        delete_rule(&netsh, names[next])?;
+        for arguments in windows_rule_arguments(names[next], &wanted) {
+            windows_run(&netsh, &arguments)?;
+        }
+        if let Some(current) = family.generation {
+            delete_rule(&netsh, names[current])?;
+        }
+        *family = WindowsFamily {
+            generation: Some(next),
+            blocked: wanted,
+        };
+    }
+    Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
 pub(crate) fn uninstall() -> Result<()> {
-    bail!("Only Linux and macOS are supported")
+    *WINDOWS_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let netsh = netsh()?;
+    for name in WINDOWS_RULES {
+        delete_rule(&netsh, name)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -413,6 +668,43 @@ mod tests {
         policy.block();
         assert!(!nft_rules(&policy).contains("timeout 30s"));
         assert_eq!(pf_rules(&policy).matches("block drop out quick").count(), 2);
+    }
+
+    #[test]
+    fn windows_rules_block_each_family_in_short_chunks() {
+        let addresses: BTreeSet<IpAddr> = (0..250u32)
+            .map(|i| IpAddr::V4(std::net::Ipv4Addr::from(0xc633_6400 + i)))
+            .collect();
+        let rules = windows_rule_arguments("AGOC-IPv4-A", &addresses);
+        assert_eq!(rules.len(), 3);
+        for rule in &rules {
+            for expected in ["name=AGOC-IPv4-A", "dir=out", "action=block", "profile=any"] {
+                assert!(rule.iter().any(|arg| arg == expected), "{expected}");
+            }
+            // netsh splits on spaces; no argument may contain one.
+            assert!(rule.iter().all(|arg| !arg.contains(' ')));
+        }
+        assert!(rules[0][10].starts_with("remoteip=198.51.100.0,198.51.100.1,"));
+        let total: usize = rules
+            .iter()
+            .map(|rule| rule[10].trim_start_matches("remoteip=").split(',').count())
+            .sum();
+        assert_eq!(total, 250);
+        assert!(windows_rule_arguments("AGOC-IPv4-A", &BTreeSet::new()).is_empty());
+        assert_eq!(WINDOWS_RULES.len(), 4);
+    }
+
+    #[test]
+    fn windows_firewall_must_be_on_and_honor_local_rules() {
+        let all_on = "Domain True NotConfigured\nPrivate True True\nPublic True NotConfigured\n";
+        assert!(windows_profile_problems(all_on).unwrap().is_empty());
+        let problems =
+            windows_profile_problems("Domain False False\nPrivate True True\nPublic True False\n")
+                .unwrap();
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems[0].contains("Domain profile is turned off"));
+        assert!(windows_profile_problems("").is_err());
+        assert!(windows_profile_problems("Domain True").is_err());
     }
 
     #[test]

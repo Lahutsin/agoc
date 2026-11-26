@@ -2,7 +2,7 @@
 name = "agoc"
 version = "0.1.0"
 edition = "2021"
-description = "External-IP gate for Claude, OpenAI and Copilot destination addresses"
+description = "External-IP gate for Claude, OpenAI and Copilot destination addresses (Linux, macOS, Windows)"
 license = "MIT"
 default-run = "agoc"
 
@@ -28,9 +28,28 @@ libc = "0.2"
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", features = ["blocking"], optional = true }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", windows))'.dependencies]
 tao = { version = "0.34", optional = true }
 tray-icon = { version = "0.21", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Com",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 lto = true

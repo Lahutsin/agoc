@@ -2,9 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::Args;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeSet, io::Read, net::IpAddr, path::PathBuf, process::Command, time::Duration,
-};
+#[cfg(unix)]
+use std::process::Command;
+use std::{collections::BTreeSet, io::Read, net::IpAddr, path::PathBuf, time::Duration};
 
 #[derive(Args, Debug, Clone, Default)]
 pub struct NetworkOptions {
@@ -73,6 +73,28 @@ pub struct NetworkStatus {
     pub error: Option<String>,
 }
 
+#[cfg(windows)]
+pub fn interface_name(value: &str) -> std::result::Result<String, String> {
+    windows_interface_name(value)
+}
+
+/// Windows adapter aliases ("Ethernet", "Wi-Fi 2", localized names) may contain
+/// spaces and non-ASCII letters, but never control characters or quotes.
+#[cfg(any(windows, test))]
+fn windows_interface_name(value: &str) -> std::result::Result<String, String> {
+    if !value.is_empty()
+        && value.chars().count() <= 256
+        && !value.starts_with('-')
+        && value == value.trim()
+        && !value.chars().any(|c| c.is_control() || c == '"')
+    {
+        Ok(value.into())
+    } else {
+        Err("Expected a network adapter name such as Ethernet or Wi-Fi".into())
+    }
+}
+
+#[cfg(not(windows))]
 pub fn interface_name(value: &str) -> std::result::Result<String, String> {
     if !value.is_empty()
         && value.len() < 64
@@ -87,6 +109,7 @@ pub fn interface_name(value: &str) -> std::result::Result<String, String> {
     }
 }
 
+#[cfg(unix)]
 fn output(programs: &[&str], args: &[&str]) -> Result<String> {
     let program = crate::executable(programs)?;
     let output = Command::new(&program)
@@ -235,7 +258,141 @@ pub fn direct_interface(requested: Option<&str>) -> Result<String> {
     mac_candidate(&v6, usable)?.context("No active physical default-route interface found")
 }
 
-fn probe_client(interface: Option<&str>) -> Result<Client> {
+/// A network adapter as reported by `GetIfTable2`.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+pub struct WinAdapter {
+    pub index: u32,
+    pub alias: String,
+    pub kind: u32,
+    pub hardware: bool,
+    pub filter: bool,
+    pub up: bool,
+}
+
+#[cfg(any(windows, test))]
+impl WinAdapter {
+    /// An active hardware Ethernet (IF_TYPE_ETHERNET_CSMACD) or Wi-Fi
+    /// (IF_TYPE_IEEE80211) adapter. VPN adapters (TAP, Wintun, WireGuard),
+    /// Hyper-V/WSL switches and NDIS filter instances are not hardware-backed.
+    pub fn physical(&self) -> bool {
+        self.hardware && !self.filter && self.up && matches!(self.kind, 6 | 71)
+    }
+}
+
+/// A default route with its effective metric (route + interface metric).
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+pub struct WinRoute {
+    pub index: u32,
+    pub ipv6: bool,
+    pub metric: u32,
+}
+
+/// A unicast address; `usable` when preferred and allowed as a source.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone)]
+pub struct WinAddress {
+    pub index: u32,
+    pub ip: IpAddr,
+    pub usable: bool,
+}
+
+/// The interface of the lowest-metric physical default route of one family.
+#[cfg(any(windows, test))]
+fn windows_candidate(
+    routes: &[WinRoute],
+    ipv6: bool,
+    mut usable: impl FnMut(u32) -> bool,
+) -> Result<Option<u32>> {
+    let candidates: Vec<_> = routes
+        .iter()
+        .filter(|route| route.ipv6 == ipv6 && usable(route.index))
+        .collect();
+    let Some(metric) = candidates.iter().map(|route| route.metric).min() else {
+        return Ok(None);
+    };
+    let indexes: BTreeSet<_> = candidates
+        .iter()
+        .filter(|route| route.metric == metric)
+        .map(|route| route.index)
+        .collect();
+    if indexes.len() != 1 {
+        bail!("Multiple physical default routes; select --direct-interface explicitly");
+    }
+    Ok(indexes.into_iter().next())
+}
+
+/// A source address of the adapter that can reach the Internet: no loopback,
+/// link-local or IPv6 unique-local addresses.
+#[cfg(any(windows, test))]
+fn windows_source(addresses: &[WinAddress], index: u32, ipv6: bool) -> Option<IpAddr> {
+    addresses
+        .iter()
+        .filter(|address| address.index == index && address.usable)
+        .map(|address| address.ip)
+        .filter(|ip| ip.is_ipv6() == ipv6 && !ip.is_loopback() && !ip.is_unspecified())
+        .filter(|ip| match ip {
+            IpAddr::V4(ip) => !ip.is_link_local(),
+            IpAddr::V6(ip) => {
+                let first = ip.segments()[0];
+                first & 0xffc0 != 0xfe80 && first & 0xfe00 != 0xfc00
+            }
+        })
+        .min()
+}
+
+#[cfg(windows)]
+pub fn direct_interface(requested: Option<&str>) -> Result<String> {
+    let adapters = crate::windows::adapters()?;
+    let physical = |index: u32| {
+        adapters
+            .iter()
+            .any(|adapter| adapter.index == index && adapter.physical())
+    };
+    if let Some(name) = requested {
+        interface_name(name).map_err(anyhow::Error::msg)?;
+        let adapter = adapters
+            .iter()
+            .find(|adapter| adapter.alias == name && !adapter.filter)
+            .with_context(|| format!("Network adapter {name:?} not found"))?;
+        if !adapter.physical() {
+            bail!("{name} is not an active hardware Ethernet/Wi-Fi adapter");
+        }
+        return Ok(name.into());
+    }
+    let routes = crate::windows::default_routes()?;
+    let index = match windows_candidate(&routes, false, physical)? {
+        Some(index) => index,
+        None => windows_candidate(&routes, true, physical)?
+            .context("Cannot identify the original connection; specify --direct-interface")?,
+    };
+    adapters
+        .iter()
+        .find(|adapter| adapter.index == index && !adapter.filter)
+        .map(|adapter| adapter.alias.clone())
+        .context("Default-route adapter disappeared")
+}
+
+/// Windows has no SO_BINDTODEVICE that reqwest can use. Binding the socket to
+/// the adapter's own address works instead: with the default strong-host send
+/// model, Windows only routes such packets through the adapter owning that
+/// address. A missing address fails; it never falls back to the default route.
+#[cfg(windows)]
+fn source_address(interface: &str, ipv6: bool) -> Result<IpAddr> {
+    let adapter = crate::windows::adapters()?
+        .into_iter()
+        .find(|adapter| adapter.alias == interface && !adapter.filter)
+        .with_context(|| format!("Network adapter {interface:?} not found"))?;
+    windows_source(&crate::windows::unicast_addresses()?, adapter.index, ipv6).with_context(|| {
+        format!(
+            "{interface} has no usable {} address",
+            if ipv6 { "IPv6" } else { "IPv4" }
+        )
+    })
+}
+
+fn probe_client(interface: Option<&str>, ipv6: bool) -> Result<Client> {
     let mut builder = Client::builder()
         .no_proxy()
         .https_only(true)
@@ -244,13 +401,21 @@ fn probe_client(interface: Option<&str>) -> Result<Client> {
         .timeout(Duration::from_secs(5))
         .pool_max_idle_per_host(0);
     if let Some(name) = interface {
-        builder = builder.interface(name);
+        #[cfg(unix)]
+        {
+            let _ = ipv6;
+            builder = builder.interface(name);
+        }
+        #[cfg(windows)]
+        {
+            builder = builder.local_address(source_address(name, ipv6)?);
+        }
     }
     Ok(builder.build()?)
 }
 
 pub fn public_ip(ipv6: bool, interface: Option<&str>) -> Result<IpAddr> {
-    let client = probe_client(interface)?;
+    let client = probe_client(interface, ipv6)?;
     let urls = if ipv6 {
         ["https://api6.ipify.org", "https://ipv6.icanhazip.com"]
     } else {
@@ -356,6 +521,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interface_names_cannot_be_paths_or_flags() {
         assert!(interface_name("enp2s0").is_ok());
@@ -365,10 +531,114 @@ mod tests {
     }
 
     #[test]
+    fn windows_prefers_lowest_effective_metric_physical_adapter() {
+        let adapter = |index, alias: &str, kind, hardware, filter, up| WinAdapter {
+            index,
+            alias: alias.into(),
+            kind,
+            hardware,
+            filter,
+            up,
+        };
+        let adapters = [
+            adapter(3, "Ethernet", 6, true, false, true),
+            adapter(4, "Wi-Fi", 71, true, false, true),
+            adapter(7, "WireGuard Tunnel", 53, false, false, true),
+            adapter(8, "OpenVPN TAP", 6, false, false, true),
+            adapter(9, "Ethernet-WFP LightWeight Filter", 6, true, true, true),
+            adapter(10, "Ethernet 2", 6, true, false, false),
+        ];
+        let physical = |index| adapters.iter().any(|a| a.index == index && a.physical());
+        assert_eq!(
+            adapters
+                .iter()
+                .filter(|a| a.physical())
+                .map(|a| a.index)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        let route = |index, ipv6, metric| WinRoute {
+            index,
+            ipv6,
+            metric,
+        };
+        let routes = [
+            route(7, false, 5),
+            route(8, false, 1),
+            route(3, false, 35),
+            route(4, false, 55),
+            route(4, true, 20),
+        ];
+        assert_eq!(
+            windows_candidate(&routes, false, physical).unwrap(),
+            Some(3)
+        );
+        assert_eq!(windows_candidate(&routes, true, physical).unwrap(), Some(4));
+        assert!(
+            windows_candidate(&[route(3, false, 35), route(4, false, 35)], false, physical)
+                .is_err()
+        );
+        assert_eq!(
+            windows_candidate(&[route(3, false, 10), route(3, false, 10)], false, physical)
+                .unwrap(),
+            Some(3)
+        );
+        assert_eq!(
+            windows_candidate(&routes[..2], false, physical).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_source_skips_link_local_unique_local_and_unusable_addresses() {
+        let address = |index, ip: &str, usable| WinAddress {
+            index,
+            ip: ip.parse().unwrap(),
+            usable,
+        };
+        let addresses = [
+            address(3, "169.254.10.1", true),
+            address(3, "192.168.1.20", true),
+            address(4, "192.168.1.30", true),
+            address(3, "fe80::1", true),
+            address(3, "fd00::5", true),
+            address(3, "2001:db8::9", false),
+            address(3, "2001:db8::7", true),
+        ];
+        assert_eq!(
+            windows_source(&addresses, 3, false),
+            Some("192.168.1.20".parse().unwrap())
+        );
+        assert_eq!(
+            windows_source(&addresses, 3, true),
+            Some("2001:db8::7".parse().unwrap())
+        );
+        assert_eq!(windows_source(&addresses[..1], 3, false), None);
+        assert_eq!(windows_source(&addresses, 5, false), None);
+    }
+
+    #[test]
+    fn windows_adapter_names_allow_spaces_but_not_quotes_or_flags() {
+        for good in ["Ethernet", "Wi-Fi 2", "Беспроводная сеть"] {
+            assert!(windows_interface_name(good).is_ok(), "{good}");
+        }
+        for bad in ["", "-Wi-Fi", "Wi\"Fi", "Wi-Fi\n", " Wi-Fi"] {
+            assert!(windows_interface_name(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_windows_adapter_never_falls_back_to_default_route() {
+        assert!(probe_client(Some("agoc-missing-adapter"), false).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn failed_interface_binding_never_falls_back_to_default_route() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
-        let client = probe_client(Some("ab-missing0")).unwrap();
+        let client = probe_client(Some("ab-missing0"), false).unwrap();
         let error = client
             .get(format!("https://{}", listener.local_addr().unwrap()))
             .send()
