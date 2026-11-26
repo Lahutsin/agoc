@@ -31,7 +31,7 @@ use std::{
 #[derive(Parser, Debug)]
 #[command(
     version,
-    about = "External-IP gate for AI services (Claude, OpenAI, Copilot) in the system tray"
+    about = "Outbound AI-network firewall control for sensitive software environments in the system tray"
 )]
 pub struct Options {
     /// Use the restricted passwordless helper installed by install-autostart.sh.

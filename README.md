@@ -1,31 +1,23 @@
 # AGOC
 
-**AGOC** - anti-ban for **A**nthropic, **G**oogle, **O**penAI and **C**opilot
-(formerly *Antiban*).
+**AGOC** (**A**I **G**ate & **O**utbound **C**ontrol) is a host-level firewall
+policy tool for Linux, macOS and Windows, with a command-line monitor and a
+system tray app. It is designed to block outbound traffic to public AI services
+(Claude/Anthropic, OpenAI/ChatGPT, GitHub Copilot, Microsoft Copilot, and custom
+`--domain` targets) in sensitive and critical software development
+environments—such as defense-industrial, aerospace, and regulated enterprise
+sectors—to prevent accidental data leakage and unauthorized AI usage over direct
+network routes.
 
-A Rust IP gate for Linux, macOS and Windows, with a command-line monitor and a
-system tray app. Known destination IPs of AI services (Claude/Anthropic, OpenAI/ChatGPT,
-GitHub Copilot, Microsoft Copilot) are allowed only when the public address
-differs from the original address measured directly through the physical
-network interface. A VPN is optional: any public-IP change counts.
+Known destination IPs of AI services remain **blocked by default** on the direct
+physical network interface and are allowed only when traffic is routed through
+an approved isolated egress whose public address differs from the physical
+interface's direct exit.
 
-**This is a best-effort IP filter, not a leak-proof kill switch or ban protection.**
-Read [Limitations](#limitations) before relying on it. Google Gemini is **not**
-blocked: it shares servers with Search, Gmail and YouTube (see Limitations).
-
-### Upgrading from Antiban
-
-Paths and names changed: binaries `agoc`/`agoc-tray`, firewall table
-`inet agoc`, PF anchor `agoc`, `/opt/agoc` and `dev.agoc` installations.
-Quit the old tray first and uninstall the old version with the uninstaller from
-before the rename (the installer refuses to run while it is present):
-
-```sh
-bash <(git show be91a88:scripts/uninstall-autostart.sh)
-```
-
-On macOS, also replace `anchor "antiban"` with `anchor "agoc"` in `/etc/pf.conf`
-(see [macOS PF setup](#macos-pf-setup)). Saved baseline files stay compatible.
+**This is a best-effort destination-IP filter, not a leak-proof DLP or
+air-gap substitute.** Read [Limitations](#limitations) before relying on it.
+Google Gemini is **not** blocked: it shares servers with Search, Gmail and
+YouTube (see Limitations).
 
 ## Build
 

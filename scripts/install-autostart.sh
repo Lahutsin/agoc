@@ -142,7 +142,7 @@ if [[ "$platform" == linux ]]; then
 [Desktop Entry]
 Type=Application
 Name=AGOC
-Comment=External-IP gate for AI services
+Comment=Outbound AI-network firewall control for sensitive environments
 Exec=$destination/agoc-tray --installed-helper
 Terminal=false
 StartupNotify=false
